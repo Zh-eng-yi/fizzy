@@ -13,7 +13,7 @@ class LLMClient:
         """
         `model` must be a fully-qualified litellm model string, e.g.:
             'claude-3-5-sonnet-20241022'   (Anthropic)
-            'gemini/gemini-2.0-flash'      (Gemini)
+            'gemini/gemini-2.5-flash'      (Gemini)
         The API key is passed explicitly per call so it is never stored
         in a global litellm config.
         """
