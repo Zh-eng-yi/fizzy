@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from fizzy.chat_loop import ChatLoop
-from fizzy.session import Session
+from fizzy.session import FileEntry, Session
 from fizzy.token_tracker import TokenStatus
 
 
@@ -188,3 +188,172 @@ class TestStreamErrors:
         # "second" message should be in history with its reply
         assert any(m["content"] == "second" for m in session.history)
         assert any(m["content"] == "ok" for m in session.history)
+
+
+# ---------------------------------------------------------------------------
+# /add command dispatch
+# ---------------------------------------------------------------------------
+
+class TestAddCommand:
+    def test_add_does_not_call_stream(self):
+        with patch("fizzy.chat_loop.file_context.add_file", return_value=(True, "Added 'foo.py'.")):
+            loop, _, client, *_ = _make_loop(["/add foo.py"])
+            loop.run()
+            client.stream.assert_not_called()
+
+    def test_add_success_prints_info_with_filename(self):
+        with patch("fizzy.chat_loop.file_context.add_file", return_value=(True, "Added 'foo.py'.")):
+            loop, _, _, _, renderer, _ = _make_loop(["/add foo.py"])
+            loop.run()
+            assert any("foo.py" in str(c) for c in renderer.print_info.call_args_list)
+
+    def test_add_failure_prints_error(self):
+        with patch("fizzy.chat_loop.file_context.add_file", return_value=(False, "Error: 'ghost.py' not found.")):
+            loop, _, _, _, renderer, _ = _make_loop(["/add ghost.py"])
+            loop.run()
+            renderer.print_error.assert_called()
+            assert "ghost.py" in str(renderer.print_error.call_args)
+
+    def test_add_failure_does_not_call_stream(self):
+        with patch("fizzy.chat_loop.file_context.add_file", return_value=(False, "Error: not found.")):
+            loop, _, client, *_ = _make_loop(["/add ghost.py"])
+            loop.run()
+            client.stream.assert_not_called()
+
+    def test_add_no_filename_prints_usage_hint(self):
+        loop, _, client, _, renderer, _ = _make_loop(["/add"])
+        loop.run()
+        client.stream.assert_not_called()
+        assert any("/add" in str(c) for c in renderer.print_info.call_args_list)
+
+    def test_add_whitespace_in_arg_prints_usage_hint(self):
+        loop, _, client, _, renderer, _ = _make_loop(["/add foo bar"])
+        loop.run()
+        client.stream.assert_not_called()
+        assert any("/add" in str(c) for c in renderer.print_info.call_args_list)
+
+    def test_add_command_not_stored_in_history(self):
+        with patch("fizzy.chat_loop.file_context.add_file", return_value=(True, "Added.")):
+            loop, session, *_ = _make_loop(["/add foo.py"])
+            loop.run()
+            assert session.history == []
+
+    def test_normal_message_after_add_still_sent_to_llm(self):
+        with patch("fizzy.chat_loop.file_context.add_file", return_value=(True, "Added.")):
+            loop, _, client, *_ = _make_loop(["/add foo.py", "hello"])
+            loop.run()
+            client.stream.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# System message injection
+# ---------------------------------------------------------------------------
+# refresh_files is patched to [] in this class so pre-seeded context_files
+# entries (pointing to non-existent paths) are not evicted before the LLM call.
+
+class TestSystemMessageInjection:
+    def test_no_files_stream_receives_no_system_message(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, _, client, *_ = _make_loop(["hello"])
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            assert all(m["role"] != "system" for m in messages_sent)
+
+    def test_with_files_stream_first_message_is_system(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, client, *_ = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            assert messages_sent[0]["role"] == "system"
+
+    def test_system_message_content_contains_file_body(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, client, *_ = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(
+                content="UNIQUE_MARKER = True\n", mtime=1.0
+            )
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            assert "UNIQUE_MARKER = True" in messages_sent[0]["content"]
+
+    def test_system_message_not_stored_in_session_history(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, client, *_ = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            assert all(m["role"] != "system" for m in session.history)
+
+    def test_user_message_still_present_after_system_message(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, client, *_ = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            assert any(m["role"] == "user" and m["content"] == "hello" for m in messages_sent)
+
+
+# ---------------------------------------------------------------------------
+# refresh_files wiring
+# ---------------------------------------------------------------------------
+
+class TestRefreshOnLLMTurn:
+    def test_refresh_called_once_per_llm_turn(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]) as mock_refresh:
+            loop, *_ = _make_loop(["hello", "world"])
+            loop._client.stream.side_effect = [iter(["r1"]), iter(["r2"])]
+            loop.run()
+            assert mock_refresh.call_count == 2
+
+    def test_refresh_not_called_for_add_command(self):
+        with patch("fizzy.chat_loop.file_context.add_file", return_value=(True, "Added.")):
+            with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]) as mock_refresh:
+                loop, *_ = _make_loop(["/add foo.py"])
+                loop.run()
+                mock_refresh.assert_not_called()
+
+    def test_refresh_notices_printed_before_llm_response(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=["'foo.py' reloaded."]):
+            loop, _, _, _, renderer, _ = _make_loop(["hello"])
+            loop.run()
+            assert any("foo.py" in str(c) for c in renderer.print_info.call_args_list)
+
+    def test_multiple_refresh_notices_all_printed(self):
+        notices = ["'a.py' reloaded.", "'b.py' removed from context (deleted on disk)."]
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=notices):
+            loop, _, _, _, renderer, _ = _make_loop(["hello"])
+            loop.run()
+            all_info = " ".join(str(c) for c in renderer.print_info.call_args_list)
+            assert "a.py" in all_info
+            assert "b.py" in all_info
+
+
+# ---------------------------------------------------------------------------
+# Token counting includes the system message
+# ---------------------------------------------------------------------------
+
+class TestTokenCountingWithSystemMessage:
+    def test_tracker_receives_system_message_when_files_in_context(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, _, _, _, tracker = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            # First tracker.check call (pre-send budget check)
+            first_call_messages = tracker.check.call_args_list[0].args[0]
+            assert first_call_messages[0]["role"] == "system"
+
+    def test_tracker_receives_only_history_when_no_files(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, _, _, _, _, tracker = _make_loop(["hello"])
+            loop.run()
+            first_call_messages = tracker.check.call_args_list[0].args[0]
+            assert all(m["role"] != "system" for m in first_call_messages)
+
+    def test_tracker_post_send_check_also_includes_system_message(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, _, _, _, tracker = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            # Second tracker.check call (post-send render_status check)
+            second_call_messages = tracker.check.call_args_list[1].args[0]
+            assert second_call_messages[0]["role"] == "system"

@@ -121,15 +121,25 @@ Stateless helper module. All state lives in `Session.context_files`; none of the
 The only component that calls more than one other component. Implements the main REPL turn:
 
 ```
-1.  read_line()              → blocks for user input
-2.  strip + skip empty       → guard against whitespace-only input
-3.  check exit commands      → /quit /exit /q
-4.  add_user_message()       → append to session history
-5.  tracker.check()          → BLOCK: rollback + continue; WARN: print + proceed
-6.  client.stream()          → iterate chunks inside renderer.start_stream() Live context
-7.  add_assistant_message()  → persist full response to session history
-8.  tracker.render_status()  → print token bar
+1.  read_line()                    → blocks for user input
+2.  strip + skip empty             → guard against whitespace-only input
+3.  handle slash commands          → no LLM call for any branch
+      /add <file>                  → file_context.add_file(); print result; continue
+      /add (bad args)              → print usage hint; continue
+      /quit /exit /q               → exit
+4.  add_user_message()             → append to session history
+5.  refresh_files()                → re-read changed files; print notices
+6.  build_system_message()         → assemble {role:system} from context files (or None)
+    messages = [system_msg] + history  if files present  else  history
+7.  tracker.check(messages)        → BLOCK: rollback + continue; WARN: print + proceed
+                                     (counts file content tokens too)
+8.  client.stream(messages)        → iterate chunks inside renderer.start_stream() Live context
+9.  add_assistant_message()        → persist full response to session history
+10. rebuild messages with reply    → [system_msg] + history  or  history
+    tracker.render_status()        → print token bar
 ```
+
+**Key invariant:** the system message is never written into `session.history`. It is built fresh from `session.context_files` on every turn and prepended only to the list passed to `client.stream()` and `tracker.check()`.
 
 On any streaming error, the user message is rolled back via `session.pop_last_message()` so the history stays consistent and the loop continues.
 

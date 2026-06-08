@@ -1,3 +1,4 @@
+from fizzy import file_context
 from fizzy.io_layer import InputReader, OutputRenderer
 from fizzy.llm_client import LLMClient
 from fizzy.session import Session
@@ -41,16 +42,42 @@ class ChatLoop:
             if not text:
                 continue
 
-            # 3. Handle exit commands
+            # 3. Handle slash commands (no LLM call for any of these)
             if text.lower() in _EXIT_COMMANDS:
                 self._renderer.print_info("Goodbye!")
                 break
 
+            if text.startswith("/add"):
+                parts = text.split()
+                if len(parts) != 2:
+                    self._renderer.print_info("Usage: /add <file>")
+                else:
+                    ok, msg = file_context.add_file(self._session, parts[1])
+                    if ok:
+                        self._renderer.print_info(msg)
+                    else:
+                        self._renderer.print_error(msg)
+                continue
+
             # 4. Append user message to history
             self._session.add_user_message(text)
 
-            # 5. Check token budget before sending
-            status, used = self._tracker.check(self._session.history)
+            # 5. Refresh stale context files and print any change notices
+            for notice in file_context.refresh_files(self._session):
+                self._renderer.print_info(notice)
+
+            # 6. Assemble the full message list for this turn.
+            #    The system message (file contents) is built fresh and prepended;
+            #    it is never stored in session.history.
+            system_msg = file_context.build_system_message(self._session)
+            messages = (
+                [system_msg, *self._session.history]
+                if system_msg
+                else self._session.history
+            )
+
+            # 7. Check token budget before sending (counts file content too)
+            status, used = self._tracker.check(messages)
 
             if status == TokenStatus.BLOCK:
                 self._renderer.print_error(
@@ -67,11 +94,11 @@ class ChatLoop:
                     f"({used:,} / {self._session.max_tokens:,} tokens)."
                 )
 
-            # 6. Stream the response
+            # 8. Stream the response
             accumulated = ""
             try:
                 with self._renderer.start_stream() as live:
-                    for chunk in self._client.stream(self._session.history):
+                    for chunk in self._client.stream(messages):
                         accumulated += chunk
                         self._renderer.append_chunk(live, accumulated)
                     self._renderer.finish_stream(live, accumulated)
@@ -85,9 +112,14 @@ class ChatLoop:
                 self._session.pop_last_message()
                 continue
 
-            # 7. Persist the assistant reply
+            # 9. Persist the assistant reply
             self._session.add_assistant_message(accumulated)
 
-            # 8. Show token status
-            final_status, final_used = self._tracker.check(self._session.history)
+            # 10. Show token status (rebuild messages to include the assistant reply)
+            final_messages = (
+                [system_msg, *self._session.history]
+                if system_msg
+                else self._session.history
+            )
+            final_status, final_used = self._tracker.check(final_messages)
             self._tracker.render_status(final_status, final_used)
