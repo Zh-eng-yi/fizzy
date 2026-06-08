@@ -3,12 +3,23 @@ from pathlib import Path
 
 
 @dataclass
+class FileEntry:
+    """Snapshot of a single file held in context: its text content and the
+    mtime at the time it was last read.  Stored in Session.context_files."""
+
+    content: str
+    mtime: float  # os.stat().st_mtime at last read
+
+
+@dataclass
 class Session:
     model: str
     working_dir: Path
     max_tokens: int
     history: list[dict] = field(default_factory=list)
-    context_files: list[Path] = field(default_factory=list)
+    # Insertion-ordered map of resolved Path → FileEntry.
+    # Populated and maintained by fizzy.file_context (Week 2).
+    context_files: dict[Path, FileEntry] = field(default_factory=dict)
 
     def add_user_message(self, text: str) -> None:
         self.history.append({"role": "user", "content": text})

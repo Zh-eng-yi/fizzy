@@ -31,12 +31,14 @@ The single source of truth for all in-memory state. Passed by reference to every
 
 ```
 Session
-  model: str                  # litellm model string (e.g. "gemini/gemini-2.5-flash")
+  model: str                          # litellm model string (e.g. "gemini/gemini-2.5-flash")
   working_dir: Path
-  max_tokens: int             # context window limit for the active model
-  history: list[dict]         # Anthropic/OpenAI message format: [{role, content}, ...]
-  context_files: list[Path]   # files currently in context (Week 2)
+  max_tokens: int                     # context window limit for the active model
+  history: list[dict]                 # Anthropic/OpenAI message format: [{role, content}, ...]
+  context_files: dict[Path, FileEntry]  # insertion-ordered; managed by file_context.py
 ```
+
+`FileEntry` (defined in `session.py`): `content: str`, `mtime: float` — the file's text and the `os.stat().st_mtime` at last read.
 
 Key methods: `add_user_message`, `add_assistant_message`, `pop_last_message` (rollback), `clear_history` (compaction hook for Week 5).
 
@@ -93,6 +95,24 @@ Read-only observer — never mutates session state. Uses `litellm.token_counter`
 | `BLOCK` | ≥ 95% of limit    | Prints an error; rolls back the user message; skips the LLM call |
 
 On any counting error, falls back to `0` tokens (safely `OK`) rather than falsely blocking.
+
+---
+
+### `file_context.py` — File Context Manager
+
+Stateless helper module. All state lives in `Session.context_files`; none of these functions touch `Session.history`.
+
+| Function | Signature | Responsibility |
+|---|---|---|
+| `add_file` | `(session, path_str) → (bool, str)` | Resolve path (relative to `working_dir`), validate (exists, is file, UTF-8, ≤ 512 KB), no-op if already tracked, else store `FileEntry` |
+| `drop_file` | `(session, path_str) → (bool, str)` | Remove entry from `context_files`; error if not tracked |
+| `list_files` | `(session) → list[Path]` | Return tracked paths in insertion order |
+| `refresh_files` | `(session) → list[str]` | Compare each file's current `st_mtime` to the stored value; re-read if changed, remove if deleted; return human-readable notices |
+| `build_system_message` | `(session) → dict \| None` | Build `{"role": "system", "content": ...}` from all tracked files; returns `None` when no files are tracked |
+
+**Constants:** `MAX_FILE_BYTES = 512 * 1024` (512 KB per file).
+
+**System message** is constructed fresh before every LLM call by `chat_loop.py` and prepended to the messages list passed to `LLMClient.stream()`. It is never written into `Session.history`.
 
 ---
 
@@ -203,20 +223,22 @@ Adding a new provider in future requires: adding an entry to `_PROVIDER_PREFIX`,
 ```
 fizzy/
 ├── ARCHITECTURE.md           # this document
-├── REQUIREMENTS.md   # weekly milestones and feature plan
+├── REQUIREMENTS.md           # weekly milestones and feature plan
 ├── pyproject.toml            # dependencies and fizzy CLI entry point
 ├── .python-version           # pinned to 3.12
 ├── fizzy/
 │   ├── main.py               # entry point, CLI, bootstrap
-│   ├── session.py            # in-memory state
+│   ├── session.py            # in-memory state (Session, FileEntry)
 │   ├── llm_client.py         # litellm streaming client
 │   ├── io_layer.py           # terminal input/output
 │   ├── chat_loop.py          # REPL orchestration
-│   └── token_tracker.py      # token counting and budget enforcement
+│   ├── token_tracker.py      # token counting and budget enforcement
+│   └── file_context.py       # file context manager (Week 2)
 └── tests/
     ├── test_session.py
     ├── test_llm_client.py
     ├── test_io_layer.py
     ├── test_token_tracker.py
-    └── test_chat_loop.py
+    ├── test_chat_loop.py
+    └── test_file_context.py  # (Week 2)
 ```

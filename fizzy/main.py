@@ -52,7 +52,7 @@ _PROVIDER_ENVVAR = {
 @app.command()
 def main(
     provider: str = typer.Option(
-        "anthropic",
+        "gemini",
         "--provider", "-p",
         help="LLM provider: 'anthropic' or 'gemini'.",
     ),

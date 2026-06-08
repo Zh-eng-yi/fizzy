@@ -75,7 +75,7 @@ class TestDefaults:
         assert session.history == []
 
     def test_context_files_starts_empty(self, session):
-        assert session.context_files == []
+        assert session.context_files == {}
 
     def test_different_sessions_do_not_share_history(self):
         """Mutable default field — each instance must get its own list."""
