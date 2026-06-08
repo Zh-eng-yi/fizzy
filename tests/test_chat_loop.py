@@ -357,3 +357,115 @@ class TestTokenCountingWithSystemMessage:
             # Second tracker.check call (post-send render_status check)
             second_call_messages = tracker.check.call_args_list[1].args[0]
             assert second_call_messages[0]["role"] == "system"
+
+
+# ---------------------------------------------------------------------------
+# /drop command dispatch
+# ---------------------------------------------------------------------------
+
+class TestDropCommand:
+    def test_drop_does_not_call_stream(self):
+        with patch("fizzy.chat_loop.file_context.drop_file", return_value=(True, "Dropped 'foo.py'.")):
+            loop, _, client, *_ = _make_loop(["/drop foo.py"])
+            loop.run()
+            client.stream.assert_not_called()
+
+    def test_drop_success_prints_info_with_filename(self):
+        with patch("fizzy.chat_loop.file_context.drop_file", return_value=(True, "Dropped 'foo.py'.")):
+            loop, _, _, _, renderer, _ = _make_loop(["/drop foo.py"])
+            loop.run()
+            assert any("foo.py" in str(c) for c in renderer.print_info.call_args_list)
+
+    def test_drop_failure_prints_error_with_filename(self):
+        with patch("fizzy.chat_loop.file_context.drop_file", return_value=(False, "Error: 'ghost.py' is not in context.")):
+            loop, _, _, _, renderer, _ = _make_loop(["/drop ghost.py"])
+            loop.run()
+            renderer.print_error.assert_called()
+            assert "ghost.py" in str(renderer.print_error.call_args)
+
+    def test_drop_failure_does_not_call_stream(self):
+        with patch("fizzy.chat_loop.file_context.drop_file", return_value=(False, "Error: not in context.")):
+            loop, _, client, *_ = _make_loop(["/drop ghost.py"])
+            loop.run()
+            client.stream.assert_not_called()
+
+    def test_drop_no_filename_prints_usage_hint(self):
+        loop, _, client, _, renderer, _ = _make_loop(["/drop"])
+        loop.run()
+        client.stream.assert_not_called()
+        assert any("/drop" in str(c) for c in renderer.print_info.call_args_list)
+
+    def test_drop_whitespace_in_arg_prints_usage_hint(self):
+        loop, _, client, _, renderer, _ = _make_loop(["/drop foo bar"])
+        loop.run()
+        client.stream.assert_not_called()
+        assert any("/drop" in str(c) for c in renderer.print_info.call_args_list)
+
+    def test_drop_command_not_stored_in_history(self):
+        with patch("fizzy.chat_loop.file_context.drop_file", return_value=(True, "Dropped.")):
+            loop, session, *_ = _make_loop(["/drop foo.py"])
+            loop.run()
+            assert session.history == []
+
+    def test_normal_message_after_drop_still_sent_to_llm(self):
+        with patch("fizzy.chat_loop.file_context.drop_file", return_value=(True, "Dropped.")):
+            loop, _, client, *_ = _make_loop(["/drop foo.py", "hello"])
+            loop.run()
+            client.stream.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# /files command dispatch
+# ---------------------------------------------------------------------------
+
+class TestFilesCommand:
+    def test_files_does_not_call_stream(self):
+        loop, _, client, *_ = _make_loop(["/files"])
+        loop.run()
+        client.stream.assert_not_called()
+
+    def test_files_empty_context_prints_info(self):
+        loop, _, _, _, renderer, _ = _make_loop(["/files"])
+        loop.run()
+        renderer.print_info.assert_called()
+
+    def test_files_empty_context_message_says_no_files(self):
+        loop, _, _, _, renderer, _ = _make_loop(["/files"])
+        loop.run()
+        all_info = " ".join(str(c) for c in renderer.print_info.call_args_list).lower()
+        assert "no files" in all_info
+
+    def test_files_shows_relative_path(self):
+        loop, session, _, _, renderer, _ = _make_loop(["/files"])
+        # working_dir is Path("/tmp"); relative display should show just "foo.py"
+        session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+        loop.run()
+        all_info = " ".join(str(c) for c in renderer.print_info.call_args_list)
+        assert "foo.py" in all_info
+
+    def test_files_does_not_show_absolute_path_prefix(self):
+        loop, session, _, _, renderer, _ = _make_loop(["/files"])
+        session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+        loop.run()
+        all_info = " ".join(str(c) for c in renderer.print_info.call_args_list)
+        # relative display: "foo.py" present, full absolute "/tmp/foo.py" absent
+        assert "/tmp/foo.py" not in all_info
+
+    def test_files_multiple_files_all_shown(self):
+        loop, session, _, _, renderer, _ = _make_loop(["/files"])
+        session.context_files[Path("/tmp/alpha.py")] = FileEntry(content="a\n", mtime=1.0)
+        session.context_files[Path("/tmp/beta.py")] = FileEntry(content="b\n", mtime=1.0)
+        loop.run()
+        all_info = " ".join(str(c) for c in renderer.print_info.call_args_list)
+        assert "alpha.py" in all_info
+        assert "beta.py" in all_info
+
+    def test_files_command_not_stored_in_history(self):
+        loop, session, *_ = _make_loop(["/files"])
+        loop.run()
+        assert session.history == []
+
+    def test_normal_message_after_files_still_sent_to_llm(self):
+        loop, _, client, *_ = _make_loop(["/files", "hello"])
+        loop.run()
+        client.stream.assert_called_once()

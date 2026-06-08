@@ -59,6 +59,33 @@ class ChatLoop:
                         self._renderer.print_error(msg)
                 continue
 
+            if text.startswith("/drop"):
+                parts = text.split()
+                if len(parts) != 2:
+                    self._renderer.print_info("Usage: /drop <file>")
+                else:
+                    ok, msg = file_context.drop_file(self._session, parts[1])
+                    if ok:
+                        self._renderer.print_info(msg)
+                    else:
+                        self._renderer.print_error(msg)
+                continue
+
+            if text.strip() == "/files":
+                paths = file_context.list_files(self._session)
+                if not paths:
+                    self._renderer.print_info("No files in context.")
+                else:
+                    lines = []
+                    for path in paths:
+                        try:
+                            display = path.relative_to(self._session.working_dir)
+                        except ValueError:
+                            display = path
+                        lines.append(str(display))
+                    self._renderer.print_info("\n".join(lines))
+                continue
+
             # 4. Append user message to history
             self._session.add_user_message(text)
 

@@ -126,6 +126,10 @@ The only component that calls more than one other component. Implements the main
 3.  handle slash commands          → no LLM call for any branch
       /add <file>                  → file_context.add_file(); print result; continue
       /add (bad args)              → print usage hint; continue
+      /drop <file>                 → file_context.drop_file(); print result; continue
+      /drop (bad args)             → print usage hint; continue
+      /files                       → file_context.list_files(); print relative paths
+                                     (or "No files in context."); continue
       /quit /exit /q               → exit
 4.  add_user_message()             → append to session history
 5.  refresh_files()                → re-read changed files; print notices
