@@ -1,6 +1,7 @@
-from fizzy import file_context
+from fizzy import edit_applier, file_context
 from fizzy.io_layer import InputReader, OutputRenderer
 from fizzy.llm_client import LLMClient
+from fizzy.prompts import AGENT_INSTRUCTIONS
 from fizzy.session import Session
 from fizzy.token_tracker import TokenStatus, TokenTracker
 
@@ -94,14 +95,16 @@ class ChatLoop:
                 self._renderer.print_info(notice)
 
             # 6. Assemble the full message list for this turn.
-            #    The system message (file contents) is built fresh and prepended;
-            #    it is never stored in session.history.
+            #    When files are in context, two system messages are prepended:
+            #      [0] agent instructions (edit format rules)
+            #      [1] file contents (built fresh from context_files)
+            #    Neither is ever stored in session.history.
             system_msg = file_context.build_system_message(self._session)
-            messages = (
-                [system_msg, *self._session.history]
-                if system_msg
-                else self._session.history
-            )
+            if system_msg:
+                instructions_msg = {"role": "system", "content": AGENT_INSTRUCTIONS}
+                messages = [instructions_msg, system_msg, *self._session.history]
+            else:
+                messages = self._session.history
 
             # 7. Check token budget before sending (counts file content too)
             status, used = self._tracker.check(messages)
@@ -127,8 +130,14 @@ class ChatLoop:
                 with self._renderer.start_stream() as live:
                     for chunk in self._client.stream(messages):
                         accumulated += chunk
-                        self._renderer.append_chunk(live, accumulated)
-                    self._renderer.finish_stream(live, accumulated)
+                        self._renderer.append_chunk(
+                            live,
+                            edit_applier.sanitize_for_display(accumulated),
+                        )
+                    self._renderer.finish_stream(
+                        live,
+                        edit_applier.sanitize_for_display(accumulated),
+                    )
             except RuntimeError as exc:
                 # Auth errors and other fatal client errors
                 self._renderer.print_error(str(exc))
@@ -142,11 +151,26 @@ class ChatLoop:
             # 9. Persist the assistant reply
             self._session.add_assistant_message(accumulated)
 
+            # 9.5. Process any edit proposals in the reply and record outcomes.
+            #      The outcome message is written to session.history so the LLM
+            #      knows on the next turn whether each edit was applied or
+            #      declined — preventing it from assuming a declined edit went
+            #      through (context drift).
+            outcomes: list[str] = []
+            for proposal in edit_applier.parse_proposals(accumulated, self._session):
+                accepted = edit_applier.apply_proposal(
+                    proposal, self._session, self._renderer, self._reader
+                )
+                status = "applied" if accepted else "not applied — file unchanged"
+                outcomes.append(f"Edit to '{proposal.path.name}': {status}.")
+            if outcomes:
+                self._session.add_user_message("\n".join(outcomes))
+
             # 10. Show token status (rebuild messages to include the assistant reply)
-            final_messages = (
-                [system_msg, *self._session.history]
-                if system_msg
-                else self._session.history
-            )
+            if system_msg:
+                instructions_msg = {"role": "system", "content": AGENT_INSTRUCTIONS}
+                final_messages = [instructions_msg, system_msg, *self._session.history]
+            else:
+                final_messages = self._session.history
             final_status, final_used = self._tracker.check(final_messages)
             self._tracker.render_status(final_status, final_used)

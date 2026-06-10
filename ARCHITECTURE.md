@@ -116,6 +116,46 @@ Stateless helper module. All state lives in `Session.context_files`; none of the
 
 ---
 
+### `prompts.py` — Agent Instructions
+
+Defines the static instruction string injected into the LLM system message whenever files are in context.
+
+**`AGENT_INSTRUCTIONS: str`** — tells the LLM:
+- The exact search/replace block format it must use for file edits
+- That the SEARCH text must appear exactly once in the file
+- That only files listed in the context may be edited
+- That multiple blocks are allowed in a single response
+- That non-edit replies should use plain text
+
+This module is content-only — no functions, no state. `chat_loop.py` owns the decision of when to inject it and wraps it in `{"role": "system", "content": AGENT_INSTRUCTIONS}`.
+
+---
+
+### `edit_applier.py` — Edit Applier
+
+Stateless module that parses LLM-proposed file edits and applies them with user confirmation.
+
+**Search/replace block format** (LLM output):
+```
+<<<<<<< SEARCH src/foo.py
+<text to find — must be unique in the file>
+=======
+<replacement text>
+>>>>>>> REPLACE
+```
+
+| Symbol | Signature | Responsibility |
+|---|---|---|
+| `EditProposal` | dataclass: `path`, `search`, `replace` | Represents one validated edit extracted from the LLM response |
+| `parse_proposals` | `(response, session) → list[EditProposal]` | Scan response for all blocks; resolve each filename against `working_dir`; skip files not in `session.context_files`; keep the structural trailing `\n` so `EditProposal.search` and `.replace` are fully line-terminated strings |
+| `sanitize_for_display` | `(text) → str` | Wrap complete search/replace blocks in triple-backtick fences so Rich's Markdown renderer does not mangle the git-conflict-style markers; partial blocks (mid-stream) are left as-is |
+| `compute_diff` | `(proposal) → str` | Unified diff of `search` → `replace` using `difflib.unified_diff`; used for display before confirmation |
+| `apply_proposal` | `(proposal, session, renderer, reader) → bool` | Check uniqueness of search text (0 → error, 2+ → ambiguity error, 1 → proceed); narrow fallback when file has no trailing `\n` — strips `\n` from search/replace before matching so no spurious newline is added; display diff; prompt `[y/N]`; write to disk if confirmed; return True/False |
+
+**Key invariant:** `session.context_files` is never updated by `apply_proposal`. The next turn's `refresh_files()` call picks up the new mtime and content from disk.
+
+---
+
 ### `chat_loop.py` — Chat Loop
 
 The only component that calls more than one other component. Implements the main REPL turn:
@@ -134,16 +174,27 @@ The only component that calls more than one other component. Implements the main
 4.  add_user_message()             → append to session history
 5.  refresh_files()                → re-read changed files; print notices
 6.  build_system_message()         → assemble {role:system} from context files (or None)
-    messages = [system_msg] + history  if files present  else  history
+    if files present:
+      messages = [instructions_msg, system_msg] + history
+                  └─ AGENT_INSTRUCTIONS  └─ file contents
+    else:
+      messages = history
 7.  tracker.check(messages)        → BLOCK: rollback + continue; WARN: print + proceed
                                      (counts file content tokens too)
 8.  client.stream(messages)        → iterate chunks inside renderer.start_stream() Live context
+                                     each chunk passed to renderer as sanitize_for_display(accumulated)
+                                     (wraps complete edit blocks in code fences; partial blocks unchanged)
 9.  add_assistant_message()        → persist full response to session history
-10. rebuild messages with reply    → [system_msg] + history  or  history
-    tracker.render_status()        → print token bar
+9.5 edit_applier.parse_proposals() → extract edit blocks from reply
+    edit_applier.apply_proposal()  → for each proposal: diff → confirm → write → True/False
+    if any proposals:
+      add_user_message(outcomes)   → e.g. "Edit to 'foo.py': applied." / "not applied — file unchanged."
+                                     stored in history so LLM sees outcome on the next turn
+10. rebuild final_messages with reply → [instructions_msg, system_msg] + history  or  history
+    tracker.render_status()           → print token bar
 ```
 
-**Key invariant:** the system message is never written into `session.history`. It is built fresh from `session.context_files` on every turn and prepended only to the list passed to `client.stream()` and `tracker.check()`.
+**Key invariant:** neither system message is ever written into `session.history`. Both are assembled fresh on every turn and prepended only to the list passed to `client.stream()` and `tracker.check()`. When no files are in context, no system messages are prepended at all.
 
 On any streaming error, the user message is rolled back via `session.pop_last_message()` so the history stays consistent and the loop continues.
 
@@ -247,12 +298,16 @@ fizzy/
 │   ├── io_layer.py           # terminal input/output
 │   ├── chat_loop.py          # REPL orchestration
 │   ├── token_tracker.py      # token counting and budget enforcement
-│   └── file_context.py       # file context manager (Week 2)
+│   ├── file_context.py       # file context manager (Week 2)
+│   ├── edit_applier.py       # search/replace edit applier (Week 2)
+│   └── prompts.py            # static agent instruction strings (Week 2)
 └── tests/
     ├── test_session.py
     ├── test_llm_client.py
     ├── test_io_layer.py
     ├── test_token_tracker.py
     ├── test_chat_loop.py
-    └── test_file_context.py  # (Week 2)
+    ├── test_file_context.py  # (Week 2)
+    ├── test_edit_applier.py  # (Week 2)
+    └── test_prompts.py       # (Week 2)
 ```

@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from fizzy.chat_loop import ChatLoop
+from fizzy.prompts import AGENT_INSTRUCTIONS
 from fizzy.session import FileEntry, Session
 from fizzy.token_tracker import TokenStatus
 
@@ -275,7 +276,8 @@ class TestSystemMessageInjection:
             )
             loop.run()
             messages_sent = client.stream.call_args.args[0]
-            assert "UNIQUE_MARKER = True" in messages_sent[0]["content"]
+            # messages[0] = agent instructions; messages[1] = file contents
+            assert "UNIQUE_MARKER = True" in messages_sent[1]["content"]
 
     def test_system_message_not_stored_in_session_history(self):
         with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
@@ -291,6 +293,45 @@ class TestSystemMessageInjection:
             loop.run()
             messages_sent = client.stream.call_args.args[0]
             assert any(m["role"] == "user" and m["content"] == "hello" for m in messages_sent)
+
+    def test_with_files_first_system_message_is_agent_instructions(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, client, *_ = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            assert messages_sent[0]["role"] == "system"
+            assert messages_sent[0]["content"] == AGENT_INSTRUCTIONS
+
+    def test_with_files_second_system_message_is_file_contents(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, client, *_ = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(
+                content="UNIQUE_MARKER = True\n", mtime=1.0
+            )
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            assert messages_sent[1]["role"] == "system"
+            assert "UNIQUE_MARKER = True" in messages_sent[1]["content"]
+
+    def test_with_files_exactly_two_system_messages_prepended(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, client, *_ = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            system_count = sum(1 for m in messages_sent if m["role"] == "system")
+            assert system_count == 2
+
+    def test_no_files_agent_instructions_not_injected(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, _, client, *_ = _make_loop(["hello"])
+            loop.run()
+            messages_sent = client.stream.call_args.args[0]
+            assert not any(
+                m["role"] == "system" and m.get("content") == AGENT_INSTRUCTIONS
+                for m in messages_sent
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +398,22 @@ class TestTokenCountingWithSystemMessage:
             # Second tracker.check call (post-send render_status check)
             second_call_messages = tracker.check.call_args_list[1].args[0]
             assert second_call_messages[0]["role"] == "system"
+
+    def test_tracker_pre_send_first_message_is_agent_instructions(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, _, _, _, tracker = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            first_call_messages = tracker.check.call_args_list[0].args[0]
+            assert first_call_messages[0]["content"] == AGENT_INSTRUCTIONS
+
+    def test_tracker_post_send_first_message_is_agent_instructions(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, session, _, _, _, tracker = _make_loop(["hello"])
+            session.context_files[Path("/tmp/foo.py")] = FileEntry(content="x = 1\n", mtime=1.0)
+            loop.run()
+            second_call_messages = tracker.check.call_args_list[1].args[0]
+            assert second_call_messages[0]["content"] == AGENT_INSTRUCTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -469,3 +526,202 @@ class TestFilesCommand:
         loop, _, client, *_ = _make_loop(["/files", "hello"])
         loop.run()
         client.stream.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Edit applier integration
+# ---------------------------------------------------------------------------
+
+class TestEditApplierIntegration:
+    def test_parse_proposals_called_with_assistant_reply(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]) as mock_parse:
+            loop, session, *_ = _make_loop(["hello"], stream_chunks=["the reply"])
+            loop.run()
+            mock_parse.assert_called_once()
+            args = mock_parse.call_args.args
+            assert args[0] == "the reply"   # full accumulated reply
+            assert args[1] is session        # same session object
+
+    def test_apply_proposal_called_for_each_proposal(self):
+        fake_proposals = [MagicMock(), MagicMock()]
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=fake_proposals):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal") as mock_apply:
+                loop, *_ = _make_loop(["hello"])
+                loop.run()
+                assert mock_apply.call_count == 2
+
+    def test_apply_proposal_not_called_when_no_proposals(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal") as mock_apply:
+                loop, *_ = _make_loop(["hello"])
+                loop.run()
+                mock_apply.assert_not_called()
+
+    def test_apply_proposal_called_after_assistant_message_stored(self):
+        """Proposals are processed after add_assistant_message, so history is complete."""
+        call_order = []
+
+        def track_parse(response, session):
+            call_order.append(("parse", len(session.history)))
+            return []
+
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", side_effect=track_parse):
+            loop, *_ = _make_loop(["hello"], stream_chunks=["reply"])
+            loop.run()
+
+        # history should have both user + assistant by the time parse is called
+        assert call_order == [("parse", 2)]
+
+    def test_edit_applier_not_invoked_for_slash_commands(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals") as mock_parse:
+            loop, *_ = _make_loop(["/files"])
+            loop.run()
+            mock_parse.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Rendering sanitization — edit blocks wrapped in code fences
+# ---------------------------------------------------------------------------
+
+class TestRenderingSanitization:
+    """Complete search/replace blocks in the LLM's response must be wrapped in
+    triple-backtick fences before being passed to the Markdown renderer.
+    Rich misinterprets <<<<<<< as HTML, ======= as a setext heading, and
+    >>>>>>> as a blockquote, producing garbled output.
+    """
+
+    _BLOCK = (
+        "<<<<<<< SEARCH foo.py\n"
+        "old content\n"
+        "=======\n"
+        "new content\n"
+        ">>>>>>> REPLACE"
+    )
+
+    def test_finish_stream_receives_fenced_text_when_block_present(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]):
+                loop, _, _, _, renderer, _ = _make_loop(
+                    ["hello"], stream_chunks=[self._BLOCK]
+                )
+                loop.run()
+                _, rendered = renderer.finish_stream.call_args.args
+                assert rendered.startswith("```")
+
+    def test_finish_stream_fenced_text_preserves_block_content(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]):
+                loop, _, _, _, renderer, _ = _make_loop(
+                    ["hello"], stream_chunks=[self._BLOCK]
+                )
+                loop.run()
+                _, rendered = renderer.finish_stream.call_args.args
+                assert "<<<<<<< SEARCH foo.py" in rendered
+                assert ">>>>>>> REPLACE" in rendered
+
+    def test_finish_stream_plain_text_unchanged(self):
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            loop, _, _, _, renderer, _ = _make_loop(
+                ["hello"], stream_chunks=["just plain text"]
+            )
+            loop.run()
+            _, rendered = renderer.finish_stream.call_args.args
+            assert rendered == "just plain text"
+
+
+# ---------------------------------------------------------------------------
+# Proposal outcome feedback — LLM told whether edits were accepted/declined
+# ---------------------------------------------------------------------------
+
+class TestProposalOutcomeFeedback:
+    """After every LLM turn that contained edit proposals, a user-role message
+    is appended to session.history recording whether each edit was applied or
+    declined.  This prevents the LLM from assuming a declined edit went through
+    on subsequent turns.
+    """
+
+    def _proposal(self, name="test.py"):
+        p = MagicMock()
+        p.path.name = name
+        return p
+
+    def test_no_proposals_no_feedback_in_history(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]):
+            loop, session, *_ = _make_loop(["hello"])
+            loop.run()
+            # Only the real user message + assistant reply
+            assert len(session.history) == 2
+
+    def test_accepted_proposal_feedback_added_to_history(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
+                   return_value=[self._proposal()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=True):
+                loop, session, *_ = _make_loop(["hello"])
+                loop.run()
+                assert len(session.history) == 3
+                assert session.history[2]["role"] == "user"
+
+    def test_accepted_proposal_feedback_says_applied(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
+                   return_value=[self._proposal()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=True):
+                loop, session, *_ = _make_loop(["hello"])
+                loop.run()
+                feedback = session.history[2]["content"]
+                assert "test.py" in feedback
+                assert "applied" in feedback.lower()
+
+    def test_declined_proposal_feedback_added_to_history(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
+                   return_value=[self._proposal()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=False):
+                loop, session, *_ = _make_loop(["hello"])
+                loop.run()
+                assert len(session.history) == 3
+                assert session.history[2]["role"] == "user"
+
+    def test_declined_proposal_feedback_says_not_applied(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
+                   return_value=[self._proposal()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=False):
+                loop, session, *_ = _make_loop(["hello"])
+                loop.run()
+                feedback = session.history[2]["content"]
+                assert "test.py" in feedback
+                assert "not applied" in feedback.lower()
+
+    def test_multiple_proposals_produce_single_feedback_message(self):
+        proposals = [self._proposal("foo.py"), self._proposal("bar.py")]
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
+                   return_value=proposals):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=True):
+                loop, session, *_ = _make_loop(["hello"])
+                loop.run()
+                # user + assistant + ONE combined feedback message
+                assert len(session.history) == 3
+                feedback = session.history[2]["content"]
+                assert "foo.py" in feedback
+                assert "bar.py" in feedback
+
+    def test_feedback_appears_in_subsequent_turn_messages(self):
+        """Turn 2's LLM call must include turn 1's outcome feedback so the
+        model knows the first edit was declined."""
+        call_count = {"n": 0}
+
+        def fake_parse(response, sess):
+            call_count["n"] += 1
+            return [self._proposal()] if call_count["n"] == 1 else []
+
+        with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
+            with patch("fizzy.chat_loop.edit_applier.parse_proposals",
+                       side_effect=fake_parse):
+                with patch("fizzy.chat_loop.edit_applier.apply_proposal",
+                           return_value=False):
+                    loop, _, client, *_ = _make_loop(["hello", "world"])
+                    client.stream.side_effect = [iter(["reply1"]), iter(["reply2"])]
+                    loop.run()
+
+        second_call_msgs = client.stream.call_args_list[1].args[0]
+        all_content = " ".join(m["content"] for m in second_call_msgs)
+        assert "test.py" in all_content
+        assert "not applied" in all_content.lower()
