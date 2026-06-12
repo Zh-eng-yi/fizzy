@@ -3,8 +3,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from fizzy.edit_applier import EditProposal, apply_proposal, compute_diff, parse_proposals, sanitize_for_display
-from fizzy.session import FileEntry, Session
+from fizzy.edit_applier import (
+    EditProposal,
+    apply_proposal,
+    compute_diff,
+    parse_proposals,
+    sanitize_for_display,
+    try_replace,
+)
+from fizzy.session import ChangeRecord, Checkpoint, FileEntry, Session
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -174,6 +181,54 @@ class TestComputeDiff:
                        for line in diff.splitlines())
 
 
+# ── try_replace ───────────────────────────────────────────────────────────────
+
+
+class TestTryReplace:
+    """The shared search→replace primitive: locate the search text exactly once
+    (with the narrow trailing-newline fallback) and substitute, reporting the
+    effective texts used or a conflict reason."""
+
+    def test_unique_match_returns_new_content(self):
+        result = try_replace("a\nold\nb\n", "old\n", "new\n")
+        assert result.content == "a\nnew\nb\n"
+        assert result.error == ""
+
+    def test_unique_match_reports_effective_search_and_replace(self):
+        result = try_replace("a\nold\nb\n", "old\n", "new\n")
+        assert result.search == "old\n"
+        assert result.replace == "new\n"
+
+    def test_replaces_only_first_occurrence_region(self):
+        result = try_replace("pre\nTARGET\npost\n", "TARGET\n", "DONE\n")
+        assert result.content == "pre\nDONE\npost\n"
+
+    def test_not_found_returns_none_content(self):
+        result = try_replace("a\nb\n", "missing\n", "new\n")
+        assert result.content is None
+
+    def test_not_found_reports_error(self):
+        result = try_replace("a\nb\n", "missing\n", "new\n")
+        assert "not found" in result.error.lower()
+
+    def test_ambiguous_returns_none_content(self):
+        result = try_replace("dup\ndup\n", "dup\n", "x\n")
+        assert result.content is None
+
+    def test_ambiguous_reports_error(self):
+        result = try_replace("dup\ndup\n", "dup\n", "x\n")
+        assert "ambiguous" in result.error.lower()
+
+    def test_narrow_fallback_matches_file_without_trailing_newline(self):
+        result = try_replace("print('x')", "print('x')\n", "print('y')\n")
+        assert result.content == "print('y')"
+
+    def test_narrow_fallback_reports_stripped_effective_texts(self):
+        result = try_replace("print('x')", "print('x')\n", "print('y')\n")
+        assert result.search == "print('x')"
+        assert result.replace == "print('y')"
+
+
 # ── apply_proposal ────────────────────────────────────────────────────────────
 
 
@@ -192,7 +247,7 @@ class TestApplyProposal:
             EditProposal(path=path, search="missing\n", replace="new\n"),
             session, _mock_renderer(), _mock_reader(),
         )
-        assert result is False
+        assert result is None
 
     def test_search_not_found_prints_error(self, tmp_path):
         session, path = self._setup(tmp_path, "actual\n")
@@ -219,7 +274,7 @@ class TestApplyProposal:
             EditProposal(path=path, search="dup\n", replace="unique\n"),
             session, _mock_renderer(), _mock_reader(),
         )
-        assert result is False
+        assert result is None
 
     def test_ambiguous_search_prints_error(self, tmp_path):
         session, path = self._setup(tmp_path, "dup\ndup\n")
@@ -248,7 +303,7 @@ class TestApplyProposal:
             EditProposal(path=path, search="old\n", replace="new\n"),
             session, _mock_renderer(), _mock_reader(answer),
         )
-        assert result is True
+        assert result is not None
 
     def test_accepted_writes_correct_content(self, tmp_path):
         session, path = self._setup(tmp_path, "old content\n")
@@ -276,7 +331,7 @@ class TestApplyProposal:
             EditProposal(path=path, search="old\n", replace="new\n"),
             session, _mock_renderer(), _mock_reader(answer),
         )
-        assert result is False
+        assert result is None
 
     def test_declined_does_not_write_disk(self, tmp_path):
         session, path = self._setup(tmp_path, "original\n")
@@ -326,7 +381,7 @@ class TestApplyProposal:
             ),
             session, _mock_renderer(), _mock_reader("y"),
         )
-        assert result is True
+        assert result is not None
         assert path.read_text() == "print('hello world!')"  # no trailing \n added
 
     def test_prompt_mentions_filename(self, tmp_path):
@@ -406,3 +461,166 @@ class TestSanitizeForDisplay:
         result = sanitize_for_display(text)
         assert "Here is the fix:" in result
         assert "Let me know if that looks good." in result
+
+
+# ── apply_proposal → change history ─────────────────────────────────────────────
+
+
+class TestApplyProposalReturnsRecord:
+    """apply_proposal returns the applied edit as a ChangeRecord (search/replace
+    fragment) or None, and no longer touches the undo/redo stacks — grouping
+    edits into a checkpoint is the chat loop's job.
+    """
+
+    def _setup(self, tmp_path: Path, content: str):
+        session = Session(model="test", working_dir=tmp_path, max_tokens=100_000)
+        path = _seed(session, tmp_path, "foo.py", content)
+        return session, path
+
+    # confirmed edit → returns a ChangeRecord
+
+    def test_confirmed_returns_change_record(self, tmp_path):
+        session, path = self._setup(tmp_path, "old\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="old\n", replace="new\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert isinstance(result, ChangeRecord)
+
+    def test_record_path_matches_proposal(self, tmp_path):
+        session, path = self._setup(tmp_path, "old\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="old\n", replace="new\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert result.path == path
+
+    def test_record_has_effective_search_and_replace(self, tmp_path):
+        session, path = self._setup(tmp_path, "old content\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="old content\n", replace="new content\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert result.search == "old content\n"
+        assert result.replace == "new content\n"
+
+    def test_narrow_fallback_record_has_stripped_fragments(self, tmp_path):
+        session, path = self._setup(tmp_path, "print('hello world')")  # no trailing newline
+        result = apply_proposal(
+            EditProposal(
+                path=path,
+                search="print('hello world')\n",
+                replace="print('hello world!')\n",
+            ),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert result.search == "print('hello world')"
+        assert result.replace == "print('hello world!')"
+
+    # edits that never write → None
+
+    def test_declined_returns_none(self, tmp_path):
+        session, path = self._setup(tmp_path, "old\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="old\n", replace="new\n"),
+            session, _mock_renderer(), _mock_reader("n"),
+        )
+        assert result is None
+
+    def test_search_not_found_returns_none(self, tmp_path):
+        session, path = self._setup(tmp_path, "actual\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="missing\n", replace="new\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert result is None
+
+    def test_ambiguous_returns_none(self, tmp_path):
+        session, path = self._setup(tmp_path, "dup\ndup\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="dup\n", replace="unique\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert result is None
+
+    # no longer manages the undo/redo stacks
+
+    def test_apply_does_not_touch_undo_stack(self, tmp_path):
+        session, path = self._setup(tmp_path, "old\n")
+        apply_proposal(
+            EditProposal(path=path, search="old\n", replace="new\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert session.undo_stack == []
+
+    def test_apply_does_not_touch_redo_stack(self, tmp_path):
+        session, path = self._setup(tmp_path, "old\n")
+        seeded = Checkpoint(records=[ChangeRecord(path=path, search="x\n", replace="y\n")])
+        session.redo_stack.append(seeded)
+        apply_proposal(
+            EditProposal(path=path, search="old\n", replace="new\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert session.redo_stack == [seeded]
+
+    # undoability via auto-expansion — when the literal replacement would not be
+    # uniquely locatable, the recorded fragment is widened with surrounding
+    # context so the edit still applies AND stays undoable.  Example:
+    # "marker\nOTHER\n" + (OTHER→marker) yields "marker\nmarker\n", where the
+    # bare "marker\n" is ambiguous, so the record widens to the whole region.
+
+    def test_non_unique_replacement_still_applies(self, tmp_path):
+        session, path = self._setup(tmp_path, "marker\nOTHER\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert result is not None
+
+    def test_non_unique_replacement_writes_new_content(self, tmp_path):
+        session, path = self._setup(tmp_path, "marker\nOTHER\n")
+        apply_proposal(
+            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert path.read_text() == "marker\nmarker\n"
+
+    def test_recorded_replace_is_unique_in_new_content(self, tmp_path):
+        session, path = self._setup(tmp_path, "marker\nOTHER\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert path.read_text().count(result.replace) == 1
+
+    def test_recorded_search_is_unique_in_original(self, tmp_path):
+        original = "marker\nOTHER\n"
+        session, path = self._setup(tmp_path, original)
+        result = apply_proposal(
+            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert original.count(result.search) == 1
+
+    def test_expanded_record_round_trips(self, tmp_path):
+        original = "marker\nOTHER\n"
+        session, path = self._setup(tmp_path, original)
+        result = apply_proposal(
+            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        new_content = path.read_text()
+        # forward (redo) reproduces the new content; reverse (undo) restores it
+        assert original.replace(result.search, result.replace, 1) == new_content
+        assert new_content.replace(result.replace, result.search, 1) == original
+
+    def test_unique_replacement_is_not_expanded(self, tmp_path):
+        # Already-unique replacements are recorded verbatim (no needless widening).
+        session, path = self._setup(tmp_path, "alpha\nbeta\n")
+        result = apply_proposal(
+            EditProposal(path=path, search="beta\n", replace="gamma\n"),
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert result.search == "beta\n"
+        assert result.replace == "gamma\n"
+        assert path.read_text() == "alpha\ngamma\n"

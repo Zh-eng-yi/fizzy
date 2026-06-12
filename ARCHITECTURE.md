@@ -36,11 +36,17 @@ Session
   max_tokens: int                     # context window limit for the active model
   history: list[dict]                 # Anthropic/OpenAI message format: [{role, content}, ...]
   context_files: dict[Path, FileEntry]  # insertion-ordered; managed by file_context.py
+  undo_stack: list[Checkpoint]        # applied-edit checkpoints (LIFO); managed by change_history.py
+  redo_stack: list[Checkpoint]        # checkpoints that were undone and may be redone
 ```
 
 `FileEntry` (defined in `session.py`): `content: str`, `mtime: float` — the file's text and the `os.stat().st_mtime` at last read.
 
-Key methods: `add_user_message`, `add_assistant_message`, `pop_last_message` (rollback), `clear_history` (compaction hook for Week 5).
+`ChangeRecord` (defined in `session.py`): `path: Path`, `search: str`, `replace: str` — one applied edit as an inverse-applicable fragment. `search`/`replace` are the *effective* texts that were applied, widened with surrounding context so each is uniquely locatable; undo reverses the edit (`replace`→`search`), redo re-applies it (`search`→`replace`). Git-independent.
+
+`Checkpoint` (defined in `session.py`): `records: list[ChangeRecord]` — one agent turn's applied edits, grouped as a single undo/redo unit.
+
+Key methods: `add_user_message`, `add_assistant_message`, `pop_last_message` (rollback), `clear_history` (clears message history only — a compaction hook for Week 5; leaves the undo/redo stacks intact).
 
 ---
 
@@ -150,9 +156,26 @@ Stateless module that parses LLM-proposed file edits and applies them with user 
 | `parse_proposals` | `(response, session) → list[EditProposal]` | Scan response for all blocks; resolve each filename against `working_dir`; skip files not in `session.context_files`; keep the structural trailing `\n` so `EditProposal.search` and `.replace` are fully line-terminated strings |
 | `sanitize_for_display` | `(text) → str` | Wrap complete search/replace blocks in triple-backtick fences so Rich's Markdown renderer does not mangle the git-conflict-style markers; partial blocks (mid-stream) are left as-is |
 | `compute_diff` | `(proposal) → str` | Unified diff of `search` → `replace` using `difflib.unified_diff`; used for display before confirmation |
-| `apply_proposal` | `(proposal, session, renderer, reader) → bool` | Check uniqueness of search text (0 → error, 2+ → ambiguity error, 1 → proceed); narrow fallback when file has no trailing `\n` — strips `\n` from search/replace before matching so no spurious newline is added; display diff; prompt `[y/N]`; write to disk if confirmed; return True/False |
+| `try_replace` | `(content, search, replace) → ReplaceResult` | Shared primitive: locate `search` exactly once (0 → not-found, 2+ → ambiguous) with the narrow trailing-newline fallback, then substitute. Reports the new content plus the *effective* search/replace used. Reused by `change_history` for inverse edits |
+| `apply_proposal` | `(proposal, session, renderer, reader) → ChangeRecord \| None` | `try_replace` the search (conflict → error, return `None`); display diff; prompt `[y/N]`; write to disk if confirmed; return the applied edit as a `ChangeRecord` whose fragment is auto-widened with surrounding context (via `_expand_to_unique`) so the replacement stays uniquely locatable for a later undo. Does **not** touch the undo/redo stacks |
 
-**Key invariant:** `session.context_files` is never updated by `apply_proposal`. The next turn's `refresh_files()` call picks up the new mtime and content from disk.
+**Key invariant:** `session.context_files` and the undo/redo stacks are never updated by `apply_proposal`. The next turn's `refresh_files()` call picks up the new content from disk, and `chat_loop` groups the returned `ChangeRecord`s into a checkpoint. A successfully applied edit is undoable by construction: `search` is unique in the original and the (auto-widened) `replace` is unique in the result. Declined, search-not-found, and ambiguous edits return `None` and never reach disk.
+
+---
+
+### `change_history.py` — Change History
+
+Stateless helper module for git-independent undo/redo. All state lives in `Session.undo_stack` / `Session.redo_stack` (lists of `Checkpoint`); none of these functions touch `Session.history`. Follows the classic editor model: recording a new checkpoint clears the redo stack.
+
+Undo/redo apply the **inverse** (or forward) search/replace edit to the *current* file via `edit_applier.try_replace`, rather than overwriting a whole-file snapshot. This preserves unrelated edits the user made elsewhere in the file; only a genuine edit to the same region blocks the operation (the fragment can no longer be uniquely located).
+
+| Function | Signature | Responsibility |
+|---|---|---|
+| `record_checkpoint` | `(session, records) → Checkpoint \| None` | Group a turn's applied edits into one `Checkpoint`; push onto `undo_stack`; clear `redo_stack`; `None` if no records |
+| `undo_last` | `(session, renderer, reader) → Checkpoint \| None` | Reverse the top checkpoint: for each record (reverse order) apply `replace`→`search` on the current file; **atomic** (any conflict aborts before any write); show per-file diff; one `[y/N]`; on confirm write all and move the checkpoint `undo`→`redo`; `None` on empty/conflict/decline |
+| `redo_last` | `(session, renderer, reader) → Checkpoint \| None` | Symmetric to `undo_last`: apply `search`→`replace` (forward order); move the checkpoint `redo`→`undo` |
+
+A conflict (file missing, or fragment not uniquely locatable) aborts the whole checkpoint with an error and leaves both stacks and all files untouched — never a partial undo. Both commands are invoked from `chat_loop.py`, which appends a one-line note to history on success.
 
 ---
 
@@ -170,6 +193,10 @@ The only component that calls more than one other component. Implements the main
       /drop (bad args)             → print usage hint; continue
       /files                       → file_context.list_files(); print relative paths
                                      (or "No files in context."); continue
+      /undo                        → change_history.undo_last(); on success append a
+                                     "Reverted the last change (files)." note to history; continue
+      /redo                        → change_history.redo_last(); on success append a
+                                     "Re-applied the last undone change (files)." note; continue
       /quit /exit /q               → exit
 4.  add_user_message()             → append to session history
 5.  refresh_files()                → re-read changed files; print notices
@@ -186,7 +213,8 @@ The only component that calls more than one other component. Implements the main
                                      (wraps complete edit blocks in code fences; partial blocks unchanged)
 9.  add_assistant_message()        → persist full response to session history
 9.5 edit_applier.parse_proposals() → extract edit blocks from reply
-    edit_applier.apply_proposal()  → for each proposal: diff → confirm → write → True/False
+    edit_applier.apply_proposal()  → for each proposal: diff → confirm → write → ChangeRecord|None
+    change_history.record_checkpoint(applied records)  → group the turn's edits into one checkpoint
     if any proposals:
       add_user_message(outcomes)   → e.g. "Edit to 'foo.py': applied." / "not applied — file unchanged."
                                      stored in history so LLM sees outcome on the next turn
@@ -300,6 +328,7 @@ fizzy/
 │   ├── token_tracker.py      # token counting and budget enforcement
 │   ├── file_context.py       # file context manager (Week 2)
 │   ├── edit_applier.py       # search/replace edit applier (Week 2)
+│   ├── change_history.py     # undo/redo change history (Week 2)
 │   └── prompts.py            # static agent instruction strings (Week 2)
 └── tests/
     ├── test_session.py
@@ -309,5 +338,6 @@ fizzy/
     ├── test_chat_loop.py
     ├── test_file_context.py  # (Week 2)
     ├── test_edit_applier.py  # (Week 2)
+    ├── test_change_history.py # (Week 2)
     └── test_prompts.py       # (Week 2)
 ```

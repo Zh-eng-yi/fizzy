@@ -16,6 +16,7 @@ Public API
 ----------
 parse_proposals  -- extract all valid EditProposals from an LLM response
 compute_diff     -- produce a unified diff string for display
+try_replace      -- locate a unique search and substitute (shared primitive)
 apply_proposal   -- show diff, prompt y/N, write to disk if confirmed
 """
 
@@ -23,9 +24,10 @@ import difflib
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from fizzy.io_layer import InputReader, OutputRenderer
-from fizzy.session import Session
+from fizzy.session import ChangeRecord, Session
 
 # Matches exactly the 7-character git-conflict-style markers.
 _PATTERN = re.compile(
@@ -45,6 +47,21 @@ class EditProposal:
     path: Path    # resolved absolute path of the target file
     search: str   # text to locate — must appear exactly once in the file
     replace: str  # text to substitute in
+
+
+class ReplaceResult(NamedTuple):
+    """Outcome of try_replace.
+
+    On success ``content`` is the new text and ``error`` is empty; ``search``
+    and ``replace`` are the *effective* fragments used (possibly stripped of a
+    trailing newline by the narrow fallback).  On conflict ``content`` is None
+    and ``error`` explains why (text not found, or ambiguous).
+    """
+
+    content: str | None
+    search: str
+    replace: str
+    error: str
 
 
 def parse_proposals(response: str, session: Session) -> list[EditProposal]:
@@ -105,60 +122,112 @@ def compute_diff(proposal: EditProposal) -> str:
     )
 
 
+def try_replace(content: str, search: str, replace: str) -> ReplaceResult:
+    """Locate ``search`` exactly once in ``content`` and substitute ``replace``.
+
+    Includes the narrow trailing-newline fallback: when ``search`` ends in a
+    newline that the file's final line lacks, both fragments are retried without
+    that trailing newline so a last-line edit matches without inserting a
+    spurious newline.
+
+    The reported ``search``/``replace`` are the *effective* fragments used.
+    """
+    count = content.count(search)
+
+    if count == 0 and search.endswith("\n") and not content.endswith("\n"):
+        stripped_search = search[:-1]
+        stripped_replace = replace[:-1] if replace.endswith("\n") else replace
+        if content.count(stripped_search) >= 1:
+            search = stripped_search
+            replace = stripped_replace
+            count = content.count(search)
+
+    if count == 0:
+        return ReplaceResult(None, search, replace, "search text not found")
+    if count > 1:
+        return ReplaceResult(
+            None, search, replace, f"search text is ambiguous — found {count} times"
+        )
+
+    new_content = content.replace(search, replace, 1)
+    return ReplaceResult(new_content, search, replace, "")
+
+
+def _expand_to_unique(
+    content: str, new_content: str, search: str, replace: str
+) -> tuple[str, str]:
+    """Widen (search, replace) with surrounding context until ``replace`` is
+    uniquely locatable in ``new_content``.
+
+    ``search`` occurs exactly once in ``content`` and
+    ``new_content == content.replace(search, replace, 1)``.  Context lines are
+    identical on both sides (unchanged text), so the widened pair remains a
+    valid inverse edit.  Converges at worst to the whole file.
+    """
+    # Already uniquely undoable → record the fragment verbatim.
+    if new_content.count(replace) == 1:
+        return search, replace
+
+    idx = content.index(search)        # unique match → single location
+    left = idx                         # shared (unchanged) prefix boundary
+    right_old = idx + len(search)      # suffix boundary in content
+    right_new = idx + len(replace)     # suffix boundary in new_content
+
+    while True:
+        rec_search = content[left:right_old]
+        rec_replace = new_content[left:right_new]
+        if new_content.count(rec_replace) == 1:
+            return rec_search, rec_replace
+
+        # Prefer extending forward by a whole line, then backward by a line.
+        if right_old < len(content):
+            nl = content.find("\n", right_old)
+            new_right = len(content) if nl == -1 else nl + 1
+            right_new += new_right - right_old  # identical suffix on both sides
+            right_old = new_right
+        elif left > 0:
+            nl = content.rfind("\n", 0, left - 1)
+            left = 0 if nl == -1 else nl + 1
+        else:
+            # Whole file consumed: the entire new_content is trivially unique.
+            return content[left:right_old], new_content[left:right_new]
+
+
 def apply_proposal(
     proposal: EditProposal,
     session: Session,
     renderer: OutputRenderer,
     reader: InputReader,
-) -> bool:
-    """Display a diff, prompt the user for confirmation, and apply if approved.
+) -> ChangeRecord | None:
+    """Display a diff, prompt for confirmation, and apply the edit if approved.
 
-    Returns True if the edit was written to disk, False otherwise.
+    Returns the applied edit as a ChangeRecord (the inverse-applicable, possibly
+    context-widened fragment) on success, or None if the search text could not
+    be uniquely located or the user declined.
 
-    The session.context_files entry for the file is intentionally *not*
-    updated here — the next turn's refresh_files() call will pick up the
-    new mtime and content from disk.
+    The undo/redo stacks and session.context_files are intentionally not touched
+    here: the chat loop groups returned records into a checkpoint, and the next
+    refresh_files() picks up the new content from disk.
     """
     content = session.context_files[proposal.path].content
-    search = proposal.search
-    replace = proposal.replace
-    count = content.count(search)
+    result = try_replace(content, proposal.search, proposal.replace)
 
-    # Narrow fallback: parse_proposals always appends a structural \n, but a
-    # file's very last line may have no trailing newline.  Try matching without
-    # the trailing \n on both search and replace so we don't accidentally add a
-    # newline that was never there.
-    if count == 0 and search.endswith("\n") and not content.endswith("\n"):
-        stripped_search = search[:-1]
-        stripped_replace = replace[:-1] if replace.endswith("\n") else replace
-        fallback_count = content.count(stripped_search)
-        if fallback_count >= 1:
-            count = fallback_count
-            search = stripped_search
-            replace = stripped_replace
-
-    if count == 0:
-        renderer.print_error(
-            f"Edit not applied: search text not found in '{proposal.path.name}'."
-        )
-        return False
-
-    if count > 1:
-        renderer.print_error(
-            f"Edit not applied: search text is ambiguous — found {count} times "
-            f"in '{proposal.path.name}'. "
-            "Provide a larger block that uniquely identifies the target."
-        )
-        return False
-
-    new_content = content.replace(search, replace, 1)
+    if result.content is None:
+        message = f"Edit not applied to '{proposal.path.name}': {result.error}."
+        if "ambiguous" in result.error:
+            message += " Provide a larger block that uniquely identifies the target."
+        renderer.print_error(message)
+        return None
 
     diff = compute_diff(proposal)
     renderer.print_info(diff)
 
     response = reader.read_line(f"Apply this change to '{proposal.path.name}'? [y/N]: ")
-    if response.strip().lower() in ("y", "yes"):
-        proposal.path.write_text(new_content, encoding="utf-8")
-        return True
+    if response.strip().lower() not in ("y", "yes"):
+        return None
 
-    return False
+    proposal.path.write_text(result.content, encoding="utf-8")
+    rec_search, rec_replace = _expand_to_unique(
+        content, result.content, result.search, result.replace
+    )
+    return ChangeRecord(path=proposal.path, search=rec_search, replace=rec_replace)

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from fizzy.session import Session
+from fizzy.session import ChangeRecord, Checkpoint, Session
 
 
 @pytest.fixture
@@ -83,3 +83,27 @@ class TestDefaults:
         s2 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
         s1.add_user_message("only in s1")
         assert s2.history == []
+
+    def test_undo_stack_starts_empty(self, session):
+        assert session.undo_stack == []
+
+    def test_redo_stack_starts_empty(self, session):
+        assert session.redo_stack == []
+
+    def test_different_sessions_do_not_share_undo_stack(self):
+        """Mutable default field — each instance must get its own undo stack."""
+        s1 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
+        s2 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
+        s1.undo_stack.append(
+            Checkpoint(records=[ChangeRecord(path=Path("/x.py"), search="a\n", replace="b\n")])
+        )
+        assert s2.undo_stack == []
+
+    def test_different_sessions_do_not_share_redo_stack(self):
+        """Mutable default field — each instance must get its own redo stack."""
+        s1 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
+        s2 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
+        s1.redo_stack.append(
+            Checkpoint(records=[ChangeRecord(path=Path("/x.py"), search="a\n", replace="b\n")])
+        )
+        assert s2.redo_stack == []

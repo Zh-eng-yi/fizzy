@@ -40,12 +40,12 @@
 | File context manager | Tracks which files are part of the current conversation and makes their contents available to the LLM |
 | Edit applier | Interprets the LLM's proposed changes, renders a diff for the user to review, and only writes to disk after explicit approval |
 | Confirmation gate | Before any disk write: shows a colored diff, prompts yes/no/edit. Blocks the edit applier from proceeding without approval. |
-| Slash commands | `/add <file>`, `/drop <file>`, `/files`, `/undo`. Each command mutates session state or triggers an action. |
-| Change history | Records what was changed (pre- and post-state) so edits can be reviewed and undone without relying on git |
+| Slash commands | `/add <file>`, `/drop <file>`, `/files`, `/undo`, `/redo`. Each command mutates session state or triggers an action. |
+| Change history | Records what each agent turn changed so edits can be reviewed, undone, and redone without relying on git — and without discarding unrelated edits the user made in the meantime |
 
-**End of week:** You can ask the LLM to edit a real file, review the diff, approve it, and see the change applied. `/undo` reverts to the pre-edit snapshot.
+**End of week:** You can ask the LLM to edit a real file, review the diff, approve it, and see the change applied. `/undo` reverts the last change and `/redo` re-applies it.
 
-**Testing:** Unit-test the edit applier against known before/after file pairs. Verify that refusing confirmation leaves the file untouched. Verify `/undo` restores the exact original content.
+**Testing:** Unit-test the edit applier against known before/after file pairs. Verify that refusing confirmation leaves the file untouched. Verify `/undo` restores the original content and `/redo` re-applies it, and that an unrelated edit elsewhere in the file is preserved across undo.
 
 ---
 

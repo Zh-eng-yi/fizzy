@@ -655,7 +655,7 @@ class TestProposalOutcomeFeedback:
     def test_accepted_proposal_feedback_added_to_history(self):
         with patch("fizzy.chat_loop.edit_applier.parse_proposals",
                    return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=True):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=MagicMock()):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 assert len(session.history) == 3
@@ -664,7 +664,7 @@ class TestProposalOutcomeFeedback:
     def test_accepted_proposal_feedback_says_applied(self):
         with patch("fizzy.chat_loop.edit_applier.parse_proposals",
                    return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=True):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=MagicMock()):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 feedback = session.history[2]["content"]
@@ -674,7 +674,7 @@ class TestProposalOutcomeFeedback:
     def test_declined_proposal_feedback_added_to_history(self):
         with patch("fizzy.chat_loop.edit_applier.parse_proposals",
                    return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=False):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=None):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 assert len(session.history) == 3
@@ -683,7 +683,7 @@ class TestProposalOutcomeFeedback:
     def test_declined_proposal_feedback_says_not_applied(self):
         with patch("fizzy.chat_loop.edit_applier.parse_proposals",
                    return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=False):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=None):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 feedback = session.history[2]["content"]
@@ -694,7 +694,7 @@ class TestProposalOutcomeFeedback:
         proposals = [self._proposal("foo.py"), self._proposal("bar.py")]
         with patch("fizzy.chat_loop.edit_applier.parse_proposals",
                    return_value=proposals):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=True):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=MagicMock()):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 # user + assistant + ONE combined feedback message
@@ -716,7 +716,7 @@ class TestProposalOutcomeFeedback:
             with patch("fizzy.chat_loop.edit_applier.parse_proposals",
                        side_effect=fake_parse):
                 with patch("fizzy.chat_loop.edit_applier.apply_proposal",
-                           return_value=False):
+                           return_value=None):
                     loop, _, client, *_ = _make_loop(["hello", "world"])
                     client.stream.side_effect = [iter(["reply1"]), iter(["reply2"])]
                     loop.run()
@@ -725,3 +725,134 @@ class TestProposalOutcomeFeedback:
         all_content = " ".join(m["content"] for m in second_call_msgs)
         assert "test.py" in all_content
         assert "not applied" in all_content.lower()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint recording — a turn's applied edits grouped into one checkpoint
+# ---------------------------------------------------------------------------
+
+class TestCheckpointRecording:
+    def test_record_checkpoint_called_with_applied_records(self):
+        rec = MagicMock()
+        proposal = MagicMock()
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[proposal]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=rec):
+                with patch("fizzy.chat_loop.change_history.record_checkpoint") as mock_cp:
+                    loop, *_ = _make_loop(["hello"])
+                    loop.run()
+                    mock_cp.assert_called_once()
+                    assert mock_cp.call_args.args[1] == [rec]
+
+    def test_record_checkpoint_not_called_when_no_edit_applied(self):
+        proposal = MagicMock()
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[proposal]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=None):
+                with patch("fizzy.chat_loop.change_history.record_checkpoint") as mock_cp:
+                    loop, *_ = _make_loop(["hello"])
+                    loop.run()
+                    mock_cp.assert_not_called()
+
+    def test_record_checkpoint_not_called_when_no_proposals(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]):
+            with patch("fizzy.chat_loop.change_history.record_checkpoint") as mock_cp:
+                loop, *_ = _make_loop(["hello"])
+                loop.run()
+                mock_cp.assert_not_called()
+
+    def test_only_applied_records_included_in_checkpoint(self):
+        applied = MagicMock()
+        p_ok, p_bad = MagicMock(), MagicMock()
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[p_ok, p_bad]):
+            with patch("fizzy.chat_loop.edit_applier.apply_proposal", side_effect=[applied, None]):
+                with patch("fizzy.chat_loop.change_history.record_checkpoint") as mock_cp:
+                    loop, *_ = _make_loop(["hello"])
+                    loop.run()
+                    mock_cp.assert_called_once()
+                    assert mock_cp.call_args.args[1] == [applied]
+
+
+# ---------------------------------------------------------------------------
+# /undo and /redo command dispatch
+# ---------------------------------------------------------------------------
+
+class TestUndoRedoCommands:
+    def _checkpoint(self, *names):
+        cp = MagicMock()
+        records = []
+        for n in names:
+            r = MagicMock()
+            r.path.name = n
+            records.append(r)
+        cp.records = records
+        return cp
+
+    # /undo
+
+    def test_undo_does_not_call_stream(self):
+        with patch("fizzy.chat_loop.change_history.undo_last", return_value=None):
+            loop, _, client, *_ = _make_loop(["/undo"])
+            loop.run()
+            client.stream.assert_not_called()
+
+    def test_undo_calls_undo_last(self):
+        with patch("fizzy.chat_loop.change_history.undo_last", return_value=None) as mock_undo:
+            loop, *_ = _make_loop(["/undo"])
+            loop.run()
+            mock_undo.assert_called_once()
+
+    def test_undo_success_adds_history_note(self):
+        cp = self._checkpoint("foo.py")
+        with patch("fizzy.chat_loop.change_history.undo_last", return_value=cp):
+            loop, session, *_ = _make_loop(["/undo"])
+            loop.run()
+            assert len(session.history) == 1
+            assert session.history[0]["role"] == "user"
+            assert "foo.py" in session.history[0]["content"]
+
+    def test_undo_success_note_lists_all_files(self):
+        cp = self._checkpoint("a.py", "b.py")
+        with patch("fizzy.chat_loop.change_history.undo_last", return_value=cp):
+            loop, session, *_ = _make_loop(["/undo"])
+            loop.run()
+            note = session.history[0]["content"]
+            assert "a.py" in note and "b.py" in note
+
+    def test_undo_noop_adds_no_history(self):
+        with patch("fizzy.chat_loop.change_history.undo_last", return_value=None):
+            loop, session, *_ = _make_loop(["/undo"])
+            loop.run()
+            assert session.history == []
+
+    def test_normal_message_after_undo_still_sent(self):
+        with patch("fizzy.chat_loop.change_history.undo_last", return_value=None):
+            loop, _, client, *_ = _make_loop(["/undo", "hello"])
+            loop.run()
+            client.stream.assert_called_once()
+
+    # /redo
+
+    def test_redo_does_not_call_stream(self):
+        with patch("fizzy.chat_loop.change_history.redo_last", return_value=None):
+            loop, _, client, *_ = _make_loop(["/redo"])
+            loop.run()
+            client.stream.assert_not_called()
+
+    def test_redo_calls_redo_last(self):
+        with patch("fizzy.chat_loop.change_history.redo_last", return_value=None) as mock_redo:
+            loop, *_ = _make_loop(["/redo"])
+            loop.run()
+            mock_redo.assert_called_once()
+
+    def test_redo_success_adds_history_note(self):
+        cp = self._checkpoint("foo.py")
+        with patch("fizzy.chat_loop.change_history.redo_last", return_value=cp):
+            loop, session, *_ = _make_loop(["/redo"])
+            loop.run()
+            assert len(session.history) == 1
+            assert "foo.py" in session.history[0]["content"]
+
+    def test_redo_noop_adds_no_history(self):
+        with patch("fizzy.chat_loop.change_history.redo_last", return_value=None):
+            loop, session, *_ = _make_loop(["/redo"])
+            loop.run()
+            assert session.history == []

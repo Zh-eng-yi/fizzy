@@ -1,4 +1,4 @@
-from fizzy import edit_applier, file_context
+from fizzy import change_history, edit_applier, file_context
 from fizzy.io_layer import InputReader, OutputRenderer
 from fizzy.llm_client import LLMClient
 from fizzy.prompts import AGENT_INSTRUCTIONS
@@ -87,6 +87,28 @@ class ChatLoop:
                     self._renderer.print_info("\n".join(lines))
                 continue
 
+            if text == "/undo":
+                checkpoint = change_history.undo_last(
+                    self._session, self._renderer, self._reader
+                )
+                if checkpoint is not None:
+                    names = ", ".join(sorted({r.path.name for r in checkpoint.records}))
+                    self._session.add_user_message(
+                        f"Reverted the last change ({names})."
+                    )
+                continue
+
+            if text == "/redo":
+                checkpoint = change_history.redo_last(
+                    self._session, self._renderer, self._reader
+                )
+                if checkpoint is not None:
+                    names = ", ".join(sorted({r.path.name for r in checkpoint.records}))
+                    self._session.add_user_message(
+                        f"Re-applied the last undone change ({names})."
+                    )
+                continue
+
             # 4. Append user message to history
             self._session.add_user_message(text)
 
@@ -157,12 +179,18 @@ class ChatLoop:
             #      declined — preventing it from assuming a declined edit went
             #      through (context drift).
             outcomes: list[str] = []
+            turn_records = []
             for proposal in edit_applier.parse_proposals(accumulated, self._session):
-                accepted = edit_applier.apply_proposal(
+                record = edit_applier.apply_proposal(
                     proposal, self._session, self._renderer, self._reader
                 )
-                status = "applied" if accepted else "not applied — file unchanged"
-                outcomes.append(f"Edit to '{proposal.path.name}': {status}.")
+                outcome = "applied" if record is not None else "not applied — file unchanged"
+                outcomes.append(f"Edit to '{proposal.path.name}': {outcome}.")
+                if record is not None:
+                    turn_records.append(record)
+            # Group the turn's applied edits into one undoable checkpoint.
+            if turn_records:
+                change_history.record_checkpoint(self._session, turn_records)
             if outcomes:
                 self._session.add_user_message("\n".join(outcomes))
 
