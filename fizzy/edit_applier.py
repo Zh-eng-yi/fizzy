@@ -15,9 +15,9 @@ processed; others are silently skipped.
 Public API
 ----------
 parse_proposals  -- extract all valid EditProposals from an LLM response
-compute_diff     -- produce a unified diff string for display
+compute_diff     -- unified diff of two whole-file contents, for display
 try_replace      -- locate a unique search and substitute (shared primitive)
-apply_proposal   -- show diff, prompt y/N, write to disk if confirmed
+apply_edits      -- group proposals by file, fold each, one atomic y/N, write
 """
 
 import difflib
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from fizzy.io_layer import InputReader, OutputRenderer
-from fizzy.session import ChangeRecord, Session
+from fizzy.session import FileSnapshot, Session
 
 # Matches exactly the 7-character git-conflict-style markers.
 _PATTERN = re.compile(
@@ -100,24 +100,26 @@ def sanitize_for_display(text: str) -> str:
     return _PATTERN.sub(lambda m: f"```\n{m.group(0)}\n```", text)
 
 
-def compute_diff(proposal: EditProposal) -> str:
-    """Return a unified diff string between the search text and the replace text.
+def compute_diff(path: Path, before: str, after: str) -> str:
+    """Return a unified diff between two whole-file contents.
 
-    Uses the proposal's filename as the diff header so the output clearly
-    names the affected file.  Returns an empty string when search == replace.
+    Uses *path* as the diff header so the output clearly names the affected
+    file.  Returns an empty string when *before* == *after*.  Shared by the edit
+    applier (apply preview) and change_history (undo/redo preview).
+
+    Lines are split *without* keepends and emitted with ``lineterm=""``, so each
+    diff line is newline-free and joined with ``\\n``.  This keeps a file whose
+    last line lacks a trailing newline from gluing its ``-`` and ``+`` lines onto
+    the same rendered line.
     """
-    # parse_proposals always produces \n-terminated search and replace strings,
-    # so splitlines(keepends=True) yields properly terminated lines and
-    # unified_diff emits each change on its own line.
-    old_lines = proposal.search.splitlines(keepends=True)
-    new_lines = proposal.replace.splitlines(keepends=True)
-    filename = str(proposal.path)
-    return "".join(
+    name = str(path)
+    return "\n".join(
         difflib.unified_diff(
-            old_lines,
-            new_lines,
-            fromfile=filename,
-            tofile=filename,
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=name,
+            tofile=name,
+            lineterm="",
         )
     )
 
@@ -153,81 +155,105 @@ def try_replace(content: str, search: str, replace: str) -> ReplaceResult:
     return ReplaceResult(new_content, search, replace, "")
 
 
-def _expand_to_unique(
-    content: str, new_content: str, search: str, replace: str
-) -> tuple[str, str]:
-    """Widen (search, replace) with surrounding context until ``replace`` is
-    uniquely locatable in ``new_content``.
+@dataclass
+class EditOutcome:
+    """Result of applying one file's edits in a turn.
 
-    ``search`` occurs exactly once in ``content`` and
-    ``new_content == content.replace(search, replace, 1)``.  Context lines are
-    identical on both sides (unchanged text), so the widened pair remains a
-    valid inverse edit.  Converges at worst to the whole file.
+    ``applied`` is True iff the file was written.  ``snapshot`` is the whole-file
+    before/after FileSnapshot for the change history (set iff applied; None for a
+    declined or no-op file).  The chat loop reports outcomes to the LLM and
+    checkpoints the applied snapshots.
     """
-    # Already uniquely undoable → record the fragment verbatim.
-    if new_content.count(replace) == 1:
-        return search, replace
 
-    idx = content.index(search)        # unique match → single location
-    left = idx                         # shared (unchanged) prefix boundary
-    right_old = idx + len(search)      # suffix boundary in content
-    right_new = idx + len(replace)     # suffix boundary in new_content
-
-    while True:
-        rec_search = content[left:right_old]
-        rec_replace = new_content[left:right_new]
-        if new_content.count(rec_replace) == 1:
-            return rec_search, rec_replace
-
-        # Prefer extending forward by a whole line, then backward by a line.
-        if right_old < len(content):
-            nl = content.find("\n", right_old)
-            new_right = len(content) if nl == -1 else nl + 1
-            right_new += new_right - right_old  # identical suffix on both sides
-            right_old = new_right
-        elif left > 0:
-            nl = content.rfind("\n", 0, left - 1)
-            left = 0 if nl == -1 else nl + 1
-        else:
-            # Whole file consumed: the entire new_content is trivially unique.
-            return content[left:right_old], new_content[left:right_new]
+    path: Path
+    applied: bool
+    snapshot: FileSnapshot | None
 
 
-def apply_proposal(
-    proposal: EditProposal,
+def _fold_file(
+    path: Path, before: str, proposals: list[EditProposal], renderer: OutputRenderer
+) -> str:
+    """Apply every block for one file to an in-memory copy and return the result.
+
+    Blocks are applied in order, each composing on the previous one's output.  A
+    block whose search text cannot be uniquely located is reported and skipped.
+    Returns the folded content (== *before* when nothing applied).
+    """
+    working = before
+    for proposal in proposals:
+        result = try_replace(working, proposal.search, proposal.replace)
+        if result.content is None:
+            message = f"Edit not applied to '{path.name}': {result.error}."
+            if "ambiguous" in result.error:
+                message += " Provide a larger block that uniquely identifies the target."
+            renderer.print_error(message)
+            continue
+        working = result.content
+    return working
+
+
+def apply_edits(
+    proposals: list[EditProposal],
     session: Session,
     renderer: OutputRenderer,
     reader: InputReader,
-) -> ChangeRecord | None:
-    """Display a diff, prompt for confirmation, and apply the edit if approved.
+) -> list[EditOutcome]:
+    """Apply a turn's edit proposals, grouped per file, atomically.
 
-    Returns the applied edit as a ChangeRecord (the inverse-applicable, possibly
-    context-widened fragment) on success, or None if the search text could not
-    be uniquely located or the user declined.
+    Proposals are grouped by target file (first-seen order).  Each file's blocks
+    are folded over the once-per-turn snapshot in ``session.context_files`` into
+    one combined whole-file change (a later block composing on an earlier one).
+    Files whose folded content is unchanged (e.g. every block conflicted) are
+    no-ops.  The diffs for all changed files are shown, then a SINGLE ``[y/N]``
+    is asked for the whole turn: on confirm every changed file is written once;
+    on decline nothing is written.
 
-    The undo/redo stacks and session.context_files are intentionally not touched
-    here: the chat loop groups returned records into a checkpoint, and the next
-    refresh_files() picks up the new content from disk.
+    Returns one EditOutcome per file (in first-seen order) carrying the
+    before/after FileSnapshot for applied files.  The undo/redo stacks and
+    session.context_files are intentionally not touched here: the chat loop
+    checkpoints the snapshots, and the next refresh_files() re-reads from disk.
     """
-    content = session.context_files[proposal.path].content
-    result = try_replace(content, proposal.search, proposal.replace)
+    grouped: dict[Path, list[EditProposal]] = {}
+    for proposal in proposals:
+        grouped.setdefault(proposal.path, []).append(proposal)
 
-    if result.content is None:
-        message = f"Edit not applied to '{proposal.path.name}': {result.error}."
-        if "ambiguous" in result.error:
-            message += " Provide a larger block that uniquely identifies the target."
-        renderer.print_error(message)
-        return None
+    # Fold each file in memory; split into changed vs. no-op.
+    changed: list[tuple[Path, str, str]] = []   # (path, before, after)
+    noops: list[Path] = []
+    for path, file_proposals in grouped.items():
+        before = session.context_files[path].content
+        after = _fold_file(path, before, file_proposals, renderer)
+        if after == before:
+            noops.append(path)
+        else:
+            changed.append((path, before, after))
 
-    diff = compute_diff(proposal)
-    renderer.print_info(diff)
+    applied_paths: set[Path] = set()
+    if changed:
+        for path, before, after in changed:
+            renderer.print_info(compute_diff(path, before, after))
+        names = ", ".join(sorted({path.name for path, _, _ in changed}))
+        response = reader.read_line(
+            f"Apply {len(changed)} change(s) to {names}? [y/N]: "
+        )
+        if response.strip().lower() in ("y", "yes"):
+            for path, _, after in changed:
+                path.write_text(after, encoding="utf-8")
+                applied_paths.add(path)
 
-    response = reader.read_line(f"Apply this change to '{proposal.path.name}'? [y/N]: ")
-    if response.strip().lower() not in ("y", "yes"):
-        return None
-
-    proposal.path.write_text(result.content, encoding="utf-8")
-    rec_search, rec_replace = _expand_to_unique(
-        content, result.content, result.search, result.replace
-    )
-    return ChangeRecord(path=proposal.path, search=rec_search, replace=rec_replace)
+    # Build outcomes in first-seen file order.
+    outcomes: list[EditOutcome] = []
+    after_by_path = {path: (before, after) for path, before, after in changed}
+    for path in grouped:
+        if path in applied_paths:
+            before, after = after_by_path[path]
+            snapshot = FileSnapshot(
+                path=path,
+                before=before,
+                after=after,
+                mtime=path.stat().st_mtime,
+            )
+            outcomes.append(EditOutcome(path=path, applied=True, snapshot=snapshot))
+        else:
+            outcomes.append(EditOutcome(path=path, applied=False, snapshot=None))
+    return outcomes

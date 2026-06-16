@@ -41,11 +41,11 @@
 | Edit applier | Interprets the LLM's proposed changes, renders a diff for the user to review, and only writes to disk after explicit approval |
 | Confirmation gate | Before any disk write: shows a colored diff, prompts yes/no/edit. Blocks the edit applier from proceeding without approval. |
 | Slash commands | `/add <file>`, `/drop <file>`, `/files`, `/undo`, `/redo`. Each command mutates session state or triggers an action. |
-| Change history | Records what each agent turn changed so edits can be reviewed, undone, and redone without relying on git — and without discarding unrelated edits the user made in the meantime |
+| Change history | Records each agent turn's edits so changes can be reviewed, undone, and redone without relying on git. Treats each file as a unit: undo restores an edited file to its pre-edit content and redo re-applies it. If a file was changed outside fizzy since the edit, undo/redo shows the difference and asks for confirmation before overwriting (it does not attempt to merge) |
 
 **End of week:** You can ask the LLM to edit a real file, review the diff, approve it, and see the change applied. `/undo` reverts the last change and `/redo` re-applies it.
 
-**Testing:** Unit-test the edit applier against known before/after file pairs. Verify that refusing confirmation leaves the file untouched. Verify `/undo` restores the original content and `/redo` re-applies it, and that an unrelated edit elsewhere in the file is preserved across undo.
+**Testing:** Unit-test the edit applier against known before/after file pairs. Verify that refusing confirmation leaves the file untouched. Verify `/undo` restores the original content and `/redo` re-applies it. Verify that when a file has been changed outside fizzy since the edit, `/undo` warns and overwrites only after explicit confirmation.
 
 ---
 
@@ -109,6 +109,6 @@
 |---|---|
 | Confirmation before disk writes | Every file edit and shell execution shows the user what will happen and requires explicit approval. No exceptions. |
 | Token budget awareness | Every LLM call checks remaining budget before sending. Warn at 80%, block and compress at 95%. |
-| Undo safety net | Change history (Week 2) is independent of git — it works even in non-git directories. |
+| Undo safety net | Change history (Week 2) is independent of git — it works even in non-git directories. Undo/redo revert whole files; if a file changed outside fizzy since the edit, they confirm before overwriting (no automatic merge). |
 | Step cap on agentic loop | Default maximum of 20 autonomous steps per task. Configurable. Always surfaces progress to the user between steps. |
 | No silent failures | If a tool call fails (lint error, file not found, API error), the failure is shown to the user and added to the LLM context. The agent does not silently skip it. |

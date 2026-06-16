@@ -92,7 +92,7 @@ class ChatLoop:
                     self._session, self._renderer, self._reader
                 )
                 if checkpoint is not None:
-                    names = ", ".join(sorted({r.path.name for r in checkpoint.records}))
+                    names = ", ".join(sorted({s.path.name for s in checkpoint.snapshots}))
                     self._session.add_user_message(
                         f"Reverted the last change ({names})."
                     )
@@ -103,7 +103,7 @@ class ChatLoop:
                     self._session, self._renderer, self._reader
                 )
                 if checkpoint is not None:
-                    names = ", ".join(sorted({r.path.name for r in checkpoint.records}))
+                    names = ", ".join(sorted({s.path.name for s in checkpoint.snapshots}))
                     self._session.add_user_message(
                         f"Re-applied the last undone change ({names})."
                     )
@@ -174,25 +174,27 @@ class ChatLoop:
             self._session.add_assistant_message(accumulated)
 
             # 9.5. Process any edit proposals in the reply and record outcomes.
-            #      The outcome message is written to session.history so the LLM
-            #      knows on the next turn whether each edit was applied or
-            #      declined — preventing it from assuming a declined edit went
-            #      through (context drift).
-            outcomes: list[str] = []
-            turn_records = []
-            for proposal in edit_applier.parse_proposals(accumulated, self._session):
-                record = edit_applier.apply_proposal(
-                    proposal, self._session, self._renderer, self._reader
+            #      apply_edits groups proposals by file, folds each file's blocks
+            #      into one combined whole-file change, and asks a single atomic
+            #      confirmation for the turn.  The per-file outcome is written to
+            #      session.history so the LLM knows next turn whether each edit was
+            #      applied or declined (preventing context drift).  Applied files'
+            #      before/after snapshots are grouped into one undo checkpoint.
+            proposals = edit_applier.parse_proposals(accumulated, self._session)
+            if proposals:
+                edit_outcomes = edit_applier.apply_edits(
+                    proposals, self._session, self._renderer, self._reader
                 )
-                outcome = "applied" if record is not None else "not applied — file unchanged"
-                outcomes.append(f"Edit to '{proposal.path.name}': {outcome}.")
-                if record is not None:
-                    turn_records.append(record)
-            # Group the turn's applied edits into one undoable checkpoint.
-            if turn_records:
-                change_history.record_checkpoint(self._session, turn_records)
-            if outcomes:
-                self._session.add_user_message("\n".join(outcomes))
+                snapshots = [o.snapshot for o in edit_outcomes if o.applied]
+                if snapshots:
+                    change_history.record_checkpoint(self._session, snapshots)
+                self._session.add_user_message(
+                    "\n".join(
+                        f"Edit to '{o.path.name}': "
+                        f"{'applied' if o.applied else 'not applied — file unchanged'}."
+                        for o in edit_outcomes
+                    )
+                )
 
             # 10. Show token status (rebuild messages to include the assistant reply)
             if system_msg:

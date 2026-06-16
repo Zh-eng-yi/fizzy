@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from fizzy.session import ChangeRecord, Checkpoint, Session
+from fizzy.session import Checkpoint, FileSnapshot, Session
 
 
 @pytest.fixture
@@ -95,7 +95,7 @@ class TestDefaults:
         s1 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
         s2 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
         s1.undo_stack.append(
-            Checkpoint(records=[ChangeRecord(path=Path("/x.py"), search="a\n", replace="b\n")])
+            Checkpoint(snapshots=[FileSnapshot(path=Path("/x.py"), before="a\n", after="b\n", mtime=0.0)])
         )
         assert s2.undo_stack == []
 
@@ -104,6 +104,6 @@ class TestDefaults:
         s1 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
         s2 = Session(model="m", working_dir=Path("/"), max_tokens=1000)
         s1.redo_stack.append(
-            Checkpoint(records=[ChangeRecord(path=Path("/x.py"), search="a\n", replace="b\n")])
+            Checkpoint(snapshots=[FileSnapshot(path=Path("/x.py"), before="a\n", after="b\n", mtime=0.0)])
         )
         assert s2.redo_stack == []

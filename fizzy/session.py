@@ -12,29 +12,31 @@ class FileEntry:
 
 
 @dataclass
-class ChangeRecord:
-    """One applied search/replace edit, stored as an inverse-applicable fragment.
+class FileSnapshot:
+    """One file's whole-file before/after contents for a single agent turn.
 
-    ``search``/``replace`` are the *effective* texts that were applied (after the
-    narrow trailing-newline fallback), widened with surrounding context where
-    needed so that each is uniquely locatable.  Undo reverses the edit (replace
-    ``replace`` with ``search``); redo re-applies it (``search`` → ``replace``).
-    Created by fizzy.edit_applier and grouped into checkpoints by
-    fizzy.change_history (Week 2)."""
+    ``before`` is the file content prior to the turn's edits (the undo target);
+    ``after`` is the content the agent wrote (the redo target).  ``mtime`` is the
+    ``os.stat().st_mtime`` of whichever state the tool last wrote for this file —
+    updated on every undo/redo write — so divergence (an out-of-band user edit)
+    can be detected cheaply, falling back to a content comparison.  Created by
+    fizzy.edit_applier and grouped into checkpoints by fizzy.change_history."""
 
     path: Path     # resolved absolute path of the edited file
-    search: str    # text that was replaced (unique in the pre-edit file)
-    replace: str   # text it became (unique in the post-edit file)
+    before: str    # whole-file content before the turn's edits
+    after: str     # whole-file content the agent wrote
+    mtime: float   # mtime of the state the tool last wrote for this file
 
 
 @dataclass
 class Checkpoint:
     """One agent turn's applied edits, grouped as a single undo/redo unit.
 
-    ``records`` are in application order.  /undo reverses the whole checkpoint;
-    /redo re-applies it.  Maintained by fizzy.change_history (Week 2)."""
+    ``snapshots`` holds one FileSnapshot per changed file.  /undo reverts every
+    file to its ``before``; /redo restores every ``after`` — atomically, with one
+    confirmation.  Maintained by fizzy.change_history (Week 2)."""
 
-    records: list[ChangeRecord]
+    snapshots: list[FileSnapshot]
 
 
 @dataclass

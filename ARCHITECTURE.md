@@ -42,9 +42,9 @@ Session
 
 `FileEntry` (defined in `session.py`): `content: str`, `mtime: float` — the file's text and the `os.stat().st_mtime` at last read.
 
-`ChangeRecord` (defined in `session.py`): `path: Path`, `search: str`, `replace: str` — one applied edit as an inverse-applicable fragment. `search`/`replace` are the *effective* texts that were applied, widened with surrounding context so each is uniquely locatable; undo reverses the edit (`replace`→`search`), redo re-applies it (`search`→`replace`). Git-independent.
+`FileSnapshot` (defined in `session.py`): `path: Path`, `before: str`, `after: str`, `mtime: float` — one file's whole-file content before and after a turn's edits. `before` is the undo target, `after` the redo target; the file is treated as a unit (overwritten wholesale, not patched). `mtime` is the stat-mtime of whichever state the tool last wrote for this file (updated on every undo/redo write) so out-of-band user edits can be detected. Git-independent.
 
-`Checkpoint` (defined in `session.py`): `records: list[ChangeRecord]` — one agent turn's applied edits, grouped as a single undo/redo unit.
+`Checkpoint` (defined in `session.py`): `snapshots: list[FileSnapshot]` — one agent turn's edits (one snapshot per changed file), grouped as a single atomic undo/redo unit.
 
 Key methods: `add_user_message`, `add_assistant_message`, `pop_last_message` (rollback), `clear_history` (clears message history only — a compaction hook for Week 5; leaves the undo/redo stacks intact).
 
@@ -155,11 +155,14 @@ Stateless module that parses LLM-proposed file edits and applies them with user 
 | `EditProposal` | dataclass: `path`, `search`, `replace` | Represents one validated edit extracted from the LLM response |
 | `parse_proposals` | `(response, session) → list[EditProposal]` | Scan response for all blocks; resolve each filename against `working_dir`; skip files not in `session.context_files`; keep the structural trailing `\n` so `EditProposal.search` and `.replace` are fully line-terminated strings |
 | `sanitize_for_display` | `(text) → str` | Wrap complete search/replace blocks in triple-backtick fences so Rich's Markdown renderer does not mangle the git-conflict-style markers; partial blocks (mid-stream) are left as-is |
-| `compute_diff` | `(proposal) → str` | Unified diff of `search` → `replace` using `difflib.unified_diff`; used for display before confirmation |
-| `try_replace` | `(content, search, replace) → ReplaceResult` | Shared primitive: locate `search` exactly once (0 → not-found, 2+ → ambiguous) with the narrow trailing-newline fallback, then substitute. Reports the new content plus the *effective* search/replace used. Reused by `change_history` for inverse edits |
-| `apply_proposal` | `(proposal, session, renderer, reader) → ChangeRecord \| None` | `try_replace` the search (conflict → error, return `None`); display diff; prompt `[y/N]`; write to disk if confirmed; return the applied edit as a `ChangeRecord` whose fragment is auto-widened with surrounding context (via `_expand_to_unique`) so the replacement stays uniquely locatable for a later undo. Does **not** touch the undo/redo stacks |
+| `compute_diff` | `(path, before, after) → str` | Unified diff of two whole-file contents via `difflib.unified_diff`; `""` when equal. Shared by the apply preview and `change_history`'s undo/redo preview |
+| `try_replace` | `(content, search, replace) → ReplaceResult` | Shared primitive: locate `search` exactly once (0 → not-found, 2+ → ambiguous) with the narrow trailing-newline fallback, then substitute. Reports the new content plus the *effective* search/replace used |
+| `apply_edits` | `(proposals, session, renderer, reader) → list[EditOutcome]` | Group proposals by file (first-seen order); fold each file's blocks over `session.context_files[path].content` into one combined whole-file change (a later block composing on an earlier one; an unlocatable block is reported and skipped). Files whose folded content is unchanged are no-ops. Show every changed file's diff, ask a **single atomic `[y/N]`** for the turn: on confirm write each changed file once; on decline write nothing. Returns one `EditOutcome` per file. Does **not** touch the undo/redo stacks |
+| `EditOutcome` | dataclass: `path: Path`, `applied: bool`, `snapshot: FileSnapshot \| None` | Per-file result; `snapshot` (before/after/mtime) is set iff the file was written |
 
-**Key invariant:** `session.context_files` and the undo/redo stacks are never updated by `apply_proposal`. The next turn's `refresh_files()` call picks up the new content from disk, and `chat_loop` groups the returned `ChangeRecord`s into a checkpoint. A successfully applied edit is undoable by construction: `search` is unique in the original and the (auto-widened) `replace` is unique in the result. Declined, search-not-found, and ambiguous edits return `None` and never reach disk.
+`apply_edits` writes each file exactly once per turn, so two same-turn edits to one file compose in memory (no intermediate write). The whole-file `before`/`after` snapshot is the unit of undo — there is no per-block fragment to re-locate, so the previous search/replace `ChangeRecord` / `_expand_to_unique` machinery is gone.
+
+**Key invariant:** `session.context_files` and the undo/redo stacks are never updated by the applier. The next turn's `refresh_files()` call picks up the new content from disk, and `chat_loop` checkpoints the applied snapshots. Declined, search-not-found, ambiguous, and no-op edits never reach disk.
 
 ---
 
@@ -167,15 +170,17 @@ Stateless module that parses LLM-proposed file edits and applies them with user 
 
 Stateless helper module for git-independent undo/redo. All state lives in `Session.undo_stack` / `Session.redo_stack` (lists of `Checkpoint`); none of these functions touch `Session.history`. Follows the classic editor model: recording a new checkpoint clears the redo stack.
 
-Undo/redo apply the **inverse** (or forward) search/replace edit to the *current* file via `edit_applier.try_replace`, rather than overwriting a whole-file snapshot. This preserves unrelated edits the user made elsewhere in the file; only a genuine edit to the same region blocks the operation (the fragment can no longer be uniquely located).
+Undo/redo overwrite each file **wholesale** with the stored snapshot (`before` for undo, `after` for redo) — the file is the unit. There is no merge: an edit the user made outside fizzy is detected and the user is warned before it is overwritten.
+
+**Divergence detection** answers "has the user touched this file since the tool last wrote it?" mtime is the fast path: if the on-disk mtime equals the path's last-write mtime the file is unchanged. If it differs, the on-disk content is compared against the state we expect (the `after` for undo, the `before` for redo) — a mismatch (or a missing file) means it diverged. All snapshots of a path share one last-write mtime, re-synced after every write (`_sync_mtime`), so undoing/redoing one checkpoint keeps divergence accurate for other checkpoints touching the same file.
 
 | Function | Signature | Responsibility |
 |---|---|---|
-| `record_checkpoint` | `(session, records) → Checkpoint \| None` | Group a turn's applied edits into one `Checkpoint`; push onto `undo_stack`; clear `redo_stack`; `None` if no records |
-| `undo_last` | `(session, renderer, reader) → Checkpoint \| None` | Reverse the top checkpoint: for each record (reverse order) apply `replace`→`search` on the current file; **atomic** (any conflict aborts before any write); show per-file diff; one `[y/N]`; on confirm write all and move the checkpoint `undo`→`redo`; `None` on empty/conflict/decline |
-| `redo_last` | `(session, renderer, reader) → Checkpoint \| None` | Symmetric to `undo_last`: apply `search`→`replace` (forward order); move the checkpoint `redo`→`undo` |
+| `record_checkpoint` | `(session, snapshots) → Checkpoint \| None` | Group a turn's `FileSnapshot`s into one `Checkpoint`; push onto `undo_stack`; clear `redo_stack`; `None` if no snapshots |
+| `undo_last` | `(session, renderer, reader) → Checkpoint \| None` | Revert the top checkpoint: write each file's `before`. **Atomic** — if every file is unchanged, apply directly with a brief message (no prompt); if any file diverged, show the diffs, warn, and ask **one** `[y/N]` (decline writes nothing). On success move the checkpoint `undo`→`redo` and re-sync mtimes; `None` on empty/decline |
+| `redo_last` | `(session, renderer, reader) → Checkpoint \| None` | Symmetric to `undo_last`: write each file's `after`; move the checkpoint `redo`→`undo` |
 
-A conflict (file missing, or fragment not uniquely locatable) aborts the whole checkpoint with an error and leaves both stacks and all files untouched — never a partial undo. Both commands are invoked from `chat_loop.py`, which appends a one-line note to history on success.
+Undo/redo are atomic over the whole checkpoint — all files or none. Both commands are invoked from `chat_loop.py`, which appends a one-line note to history on success.
 
 ---
 
@@ -212,10 +217,12 @@ The only component that calls more than one other component. Implements the main
                                      each chunk passed to renderer as sanitize_for_display(accumulated)
                                      (wraps complete edit blocks in code fences; partial blocks unchanged)
 9.  add_assistant_message()        → persist full response to session history
-9.5 edit_applier.parse_proposals() → extract edit blocks from reply
-    edit_applier.apply_proposal()  → for each proposal: diff → confirm → write → ChangeRecord|None
-    change_history.record_checkpoint(applied records)  → group the turn's edits into one checkpoint
+9.5 edit_applier.parse_proposals()  → extract edit blocks from reply
     if any proposals:
+      edit_applier.apply_edits()    → group by file, fold each (composing),
+                                      show diffs, ONE atomic confirm, write
+                                      → list[EditOutcome] (before/after snapshots)
+      change_history.record_checkpoint(applied snapshots)  → one checkpoint for the turn
       add_user_message(outcomes)   → e.g. "Edit to 'foo.py': applied." / "not applied — file unchanged."
                                      stored in history so LLM sees outcome on the next turn
 10. rebuild final_messages with reply → [instructions_msg, system_msg] + history  or  history

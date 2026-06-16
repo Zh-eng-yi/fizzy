@@ -3,7 +3,9 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from fizzy import change_history
 from fizzy.chat_loop import ChatLoop
+from fizzy.edit_applier import EditOutcome
 from fizzy.prompts import AGENT_INSTRUCTIONS
 from fizzy.session import FileEntry, Session
 from fizzy.token_tracker import TokenStatus
@@ -542,22 +544,25 @@ class TestEditApplierIntegration:
             assert args[0] == "the reply"   # full accumulated reply
             assert args[1] is session        # same session object
 
-    def test_apply_proposal_called_for_each_proposal(self):
-        fake_proposals = [MagicMock(), MagicMock()]
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=fake_proposals):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal") as mock_apply:
-                loop, *_ = _make_loop(["hello"])
+    def test_apply_edits_called_with_all_proposals(self):
+        # The whole proposal list is handed to apply_edits, which groups by file.
+        p1, p2 = MagicMock(), MagicMock()
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[p1, p2]):
+            with patch("fizzy.chat_loop.edit_applier.apply_edits", return_value=[]) as mock_apply:
+                loop, session, *_ = _make_loop(["hello"])
                 loop.run()
-                assert mock_apply.call_count == 2
+                mock_apply.assert_called_once()
+                assert mock_apply.call_args.args[0] == [p1, p2]
+                assert mock_apply.call_args.args[1] is session
 
-    def test_apply_proposal_not_called_when_no_proposals(self):
+    def test_apply_edits_not_called_when_no_proposals(self):
         with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal") as mock_apply:
+            with patch("fizzy.chat_loop.edit_applier.apply_edits") as mock_apply:
                 loop, *_ = _make_loop(["hello"])
                 loop.run()
                 mock_apply.assert_not_called()
 
-    def test_apply_proposal_called_after_assistant_message_stored(self):
+    def test_proposals_processed_after_assistant_message_stored(self):
         """Proposals are processed after add_assistant_message, so history is complete."""
         call_order = []
 
@@ -640,10 +645,10 @@ class TestProposalOutcomeFeedback:
     on subsequent turns.
     """
 
-    def _proposal(self, name="test.py"):
-        p = MagicMock()
-        p.path.name = name
-        return p
+    def _outcome(self, name="test.py", applied=True):
+        path = MagicMock()
+        path.name = name
+        return EditOutcome(path=path, applied=applied, snapshot=MagicMock() if applied else None)
 
     def test_no_proposals_no_feedback_in_history(self):
         with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[]):
@@ -652,49 +657,32 @@ class TestProposalOutcomeFeedback:
             # Only the real user message + assistant reply
             assert len(session.history) == 2
 
-    def test_accepted_proposal_feedback_added_to_history(self):
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
-                   return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=MagicMock()):
+    def test_applied_feedback_added_and_says_applied(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[MagicMock()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_edits",
+                       return_value=[self._outcome("test.py", applied=True)]):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 assert len(session.history) == 3
-                assert session.history[2]["role"] == "user"
+                feedback = session.history[2]
+                assert feedback["role"] == "user"
+                assert "test.py" in feedback["content"]
+                assert "applied" in feedback["content"].lower()
 
-    def test_accepted_proposal_feedback_says_applied(self):
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
-                   return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=MagicMock()):
-                loop, session, *_ = _make_loop(["hello"])
-                loop.run()
-                feedback = session.history[2]["content"]
-                assert "test.py" in feedback
-                assert "applied" in feedback.lower()
-
-    def test_declined_proposal_feedback_added_to_history(self):
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
-                   return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=None):
-                loop, session, *_ = _make_loop(["hello"])
-                loop.run()
-                assert len(session.history) == 3
-                assert session.history[2]["role"] == "user"
-
-    def test_declined_proposal_feedback_says_not_applied(self):
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
-                   return_value=[self._proposal()]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=None):
+    def test_declined_feedback_says_not_applied(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[MagicMock()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_edits",
+                       return_value=[self._outcome("test.py", applied=False)]):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 feedback = session.history[2]["content"]
                 assert "test.py" in feedback
                 assert "not applied" in feedback.lower()
 
-    def test_multiple_proposals_produce_single_feedback_message(self):
-        proposals = [self._proposal("foo.py"), self._proposal("bar.py")]
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals",
-                   return_value=proposals):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=MagicMock()):
+    def test_multiple_files_produce_single_feedback_message(self):
+        outcomes = [self._outcome("foo.py", True), self._outcome("bar.py", True)]
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[MagicMock()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_edits", return_value=outcomes):
                 loop, session, *_ = _make_loop(["hello"])
                 loop.run()
                 # user + assistant + ONE combined feedback message
@@ -710,13 +698,12 @@ class TestProposalOutcomeFeedback:
 
         def fake_parse(response, sess):
             call_count["n"] += 1
-            return [self._proposal()] if call_count["n"] == 1 else []
+            return [MagicMock()] if call_count["n"] == 1 else []
 
         with patch("fizzy.chat_loop.file_context.refresh_files", return_value=[]):
-            with patch("fizzy.chat_loop.edit_applier.parse_proposals",
-                       side_effect=fake_parse):
-                with patch("fizzy.chat_loop.edit_applier.apply_proposal",
-                           return_value=None):
+            with patch("fizzy.chat_loop.edit_applier.parse_proposals", side_effect=fake_parse):
+                with patch("fizzy.chat_loop.edit_applier.apply_edits",
+                           return_value=[self._outcome("test.py", applied=False)]):
                     loop, _, client, *_ = _make_loop(["hello", "world"])
                     client.stream.side_effect = [iter(["reply1"]), iter(["reply2"])]
                     loop.run()
@@ -732,21 +719,24 @@ class TestProposalOutcomeFeedback:
 # ---------------------------------------------------------------------------
 
 class TestCheckpointRecording:
-    def test_record_checkpoint_called_with_applied_records(self):
-        rec = MagicMock()
-        proposal = MagicMock()
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[proposal]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=rec):
+    def _outcome(self, applied, snapshot=None):
+        return EditOutcome(path=MagicMock(), applied=applied, snapshot=snapshot)
+
+    def test_record_checkpoint_called_with_applied_snapshots(self):
+        snap = MagicMock()
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[MagicMock()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_edits",
+                       return_value=[self._outcome(True, snap)]):
                 with patch("fizzy.chat_loop.change_history.record_checkpoint") as mock_cp:
                     loop, *_ = _make_loop(["hello"])
                     loop.run()
                     mock_cp.assert_called_once()
-                    assert mock_cp.call_args.args[1] == [rec]
+                    assert mock_cp.call_args.args[1] == [snap]
 
-    def test_record_checkpoint_not_called_when_no_edit_applied(self):
-        proposal = MagicMock()
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[proposal]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", return_value=None):
+    def test_record_checkpoint_not_called_when_nothing_applied(self):
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[MagicMock()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_edits",
+                       return_value=[self._outcome(False, None)]):
                 with patch("fizzy.chat_loop.change_history.record_checkpoint") as mock_cp:
                     loop, *_ = _make_loop(["hello"])
                     loop.run()
@@ -759,16 +749,16 @@ class TestCheckpointRecording:
                 loop.run()
                 mock_cp.assert_not_called()
 
-    def test_only_applied_records_included_in_checkpoint(self):
-        applied = MagicMock()
-        p_ok, p_bad = MagicMock(), MagicMock()
-        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[p_ok, p_bad]):
-            with patch("fizzy.chat_loop.edit_applier.apply_proposal", side_effect=[applied, None]):
+    def test_only_applied_snapshots_included_in_checkpoint(self):
+        snap = MagicMock()
+        outcomes = [self._outcome(True, snap), self._outcome(False, None)]
+        with patch("fizzy.chat_loop.edit_applier.parse_proposals", return_value=[MagicMock()]):
+            with patch("fizzy.chat_loop.edit_applier.apply_edits", return_value=outcomes):
                 with patch("fizzy.chat_loop.change_history.record_checkpoint") as mock_cp:
                     loop, *_ = _make_loop(["hello"])
                     loop.run()
                     mock_cp.assert_called_once()
-                    assert mock_cp.call_args.args[1] == [applied]
+                    assert mock_cp.call_args.args[1] == [snap]
 
 
 # ---------------------------------------------------------------------------
@@ -778,12 +768,12 @@ class TestCheckpointRecording:
 class TestUndoRedoCommands:
     def _checkpoint(self, *names):
         cp = MagicMock()
-        records = []
+        snapshots = []
         for n in names:
-            r = MagicMock()
-            r.path.name = n
-            records.append(r)
-        cp.records = records
+            s = MagicMock()
+            s.path.name = n
+            snapshots.append(s)
+        cp.snapshots = snapshots
         return cp
 
     # /undo
@@ -856,3 +846,90 @@ class TestUndoRedoCommands:
             loop, session, *_ = _make_loop(["/redo"])
             loop.run()
             assert session.history == []
+
+
+# ---------------------------------------------------------------------------
+# Sequential same-file edits in a single turn must compose
+# ---------------------------------------------------------------------------
+
+class TestSequentialSameFileEdits:
+    """When one assistant turn proposes two edits to the SAME file, both fold
+    into one whole-file snapshot (one combined diff, one confirmation, one
+    write).  The second edit builds on the first, and the single checkpoint
+    undoes back to the original content.
+    """
+
+    def _block(self, filename: str, search: str, replace: str) -> str:
+        return (
+            f"<<<<<<< SEARCH {filename}\n"
+            f"{search}"
+            f"=======\n"
+            f"{replace}"
+            f">>>>>>> REPLACE"
+        )
+
+    def _loop_for(self, tmp_path, inputs, reply):
+        """Build a ChatLoop rooted at a real tmp_path with a real LLM reply."""
+        session = Session(
+            model="claude-3-5-sonnet-20241022",
+            working_dir=tmp_path,
+            max_tokens=100_000,
+        )
+        client = MagicMock()
+        client.stream.return_value = iter([reply])
+        reader = MagicMock()
+        reader.read_line.side_effect = list(inputs) + [EOFError]
+        renderer = MagicMock()
+        live_ctx = MagicMock()
+        live_ctx.__enter__ = MagicMock(return_value=live_ctx)
+        live_ctx.__exit__ = MagicMock(return_value=False)
+        renderer.start_stream.return_value = live_ctx
+        tracker = MagicMock()
+        tracker.check.return_value = (TokenStatus.OK, 500)
+        loop = ChatLoop(
+            session=session, client=client, reader=reader,
+            renderer=renderer, tracker=tracker,
+        )
+        return loop, session
+
+    def _run_two_edit_turn(self, tmp_path):
+        """One turn that edits two different regions of foo.py; both confirmed."""
+        path = tmp_path / "foo.py"
+        original = "line one\nline two\nline three\n"
+        path.write_text(original, encoding="utf-8")
+        resolved = path.resolve()
+        reply = (
+            self._block("foo.py", "line one\n", "LINE ONE\n")
+            + "\n\n"
+            + self._block("foo.py", "line three\n", "LINE THREE\n")
+        )
+        # inputs: user prompt, then ONE [y/N] confirmation for the combined file edit
+        loop, session = self._loop_for(tmp_path, ["edit it", "y"], reply)
+        session.context_files[resolved] = FileEntry(
+            content=original, mtime=path.stat().st_mtime
+        )
+        loop.run()
+        return session, path, original
+
+    def test_both_edits_present_on_disk(self, tmp_path):
+        _, path, _ = self._run_two_edit_turn(tmp_path)
+        # The first edit (LINE ONE) must survive the second write.
+        assert path.read_text() == "LINE ONE\nline two\nLINE THREE\n"
+
+    def test_single_checkpoint_one_snapshot(self, tmp_path):
+        session, *_ = self._run_two_edit_turn(tmp_path)
+        assert len(session.undo_stack) == 1
+        # both blocks combine into ONE whole-file snapshot for the file
+        snaps = session.undo_stack[0].snapshots
+        assert len(snaps) == 1
+        assert snaps[0].before == "line one\nline two\nline three\n"
+        assert snaps[0].after == "LINE ONE\nline two\nLINE THREE\n"
+
+    def test_undo_restores_original_after_two_edits(self, tmp_path):
+        session, path, original = self._run_two_edit_turn(tmp_path)
+        # file is unchanged since the write (mtime matches) → undo applies directly
+        reader = MagicMock()
+        reader.read_line.return_value = "y"
+        result = change_history.undo_last(session, MagicMock(), reader)
+        assert result is not None
+        assert path.read_text() == original

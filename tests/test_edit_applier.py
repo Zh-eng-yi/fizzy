@@ -4,14 +4,15 @@ from unittest.mock import MagicMock
 import pytest
 
 from fizzy.edit_applier import (
+    EditOutcome,
     EditProposal,
-    apply_proposal,
+    apply_edits,
     compute_diff,
     parse_proposals,
     sanitize_for_display,
     try_replace,
 )
-from fizzy.session import ChangeRecord, Checkpoint, FileEntry, Session
+from fizzy.session import FileEntry, FileSnapshot, Session
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -146,39 +147,52 @@ class TestParseProposals:
 
 
 class TestComputeDiff:
-    def _proposal(self, tmp_path: Path, search: str, replace: str) -> EditProposal:
-        return EditProposal(path=(tmp_path / "foo.py").resolve(), search=search, replace=replace)
+    """compute_diff now takes whole-file before/after contents and returns a
+    unified diff, used for display before confirmation and during undo/redo."""
+
+    def _path(self, tmp_path: Path) -> Path:
+        return (tmp_path / "foo.py").resolve()
 
     def test_returns_string(self, tmp_path):
-        assert isinstance(compute_diff(self._proposal(tmp_path, "old\n", "new\n")), str)
+        assert isinstance(compute_diff(self._path(tmp_path), "a\n", "b\n"), str)
+
+    def test_identical_content_is_empty(self, tmp_path):
+        assert compute_diff(self._path(tmp_path), "same\n", "same\n") == ""
 
     def test_removed_line_has_minus_prefix(self, tmp_path):
-        diff = compute_diff(self._proposal(tmp_path, "old line\n", "new line\n"))
-        assert any(line.startswith("-") and "old line" in line for line in diff.splitlines())
+        diff = compute_diff(self._path(tmp_path), "old line\n", "new line\n")
+        assert any(l.startswith("-") and "old line" in l for l in diff.splitlines())
 
     def test_added_line_has_plus_prefix(self, tmp_path):
-        diff = compute_diff(self._proposal(tmp_path, "old line\n", "new line\n"))
-        assert any(line.startswith("+") and "new line" in line for line in diff.splitlines())
+        diff = compute_diff(self._path(tmp_path), "old line\n", "new line\n")
+        assert any(l.startswith("+") and "new line" in l for l in diff.splitlines())
 
-    def test_diff_contains_filename(self, tmp_path):
-        diff = compute_diff(self._proposal(tmp_path, "old\n", "new\n"))
+    def test_contains_filename(self, tmp_path):
+        diff = compute_diff(self._path(tmp_path), "a\n", "b\n")
         assert "foo.py" in diff
 
+    def test_preserves_unchanged_context_lines(self, tmp_path):
+        diff = compute_diff(self._path(tmp_path), "keep\nold\n", "keep\nnew\n")
+        # the unchanged "keep" line appears as context (space-prefixed)
+        assert any(l.startswith(" ") and "keep" in l for l in diff.splitlines())
+
     def test_changed_lines_appear_on_separate_lines(self, tmp_path):
-        # parse_proposals preserves the structural \n, so compute_diff always
-        # receives properly newline-terminated strings.  Each changed line must
-        # appear on its own diff line (not concatenated with the next).
-        diff = compute_diff(self._proposal(tmp_path, "old line\n", "new line\n"))
+        diff = compute_diff(self._path(tmp_path), "old line\n", "new line\n")
         minus = [l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")]
-        plus  = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        plus = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
         assert len(minus) == 1
         assert len(plus) == 1
 
-    def test_unchanged_content_produces_empty_diff(self, tmp_path):
-        diff = compute_diff(self._proposal(tmp_path, "same\n", "same\n"))
-        # unified_diff of identical content has no +/- lines
-        assert not any(line.startswith(("+", "-")) and not line.startswith("---") and not line.startswith("+++")
-                       for line in diff.splitlines())
+    def test_last_line_without_trailing_newline_separates_changes(self, tmp_path):
+        # Regression: whole-file contents whose last line lacks a trailing newline
+        # must not glue the '-' and '+' lines onto the same rendered line.
+        diff = compute_diff(self._path(tmp_path), "print('hi')", "print('bye')")
+        minus = [l for l in diff.splitlines() if l.startswith("-") and not l.startswith("---")]
+        plus = [l for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        assert len(minus) == 1
+        assert len(plus) == 1
+        assert "print('hi')" in minus[0]
+        assert "print('bye')" in plus[0]
 
 
 # ── try_replace ───────────────────────────────────────────────────────────────
@@ -227,172 +241,6 @@ class TestTryReplace:
         result = try_replace("print('x')", "print('x')\n", "print('y')\n")
         assert result.search == "print('x')"
         assert result.replace == "print('y')"
-
-
-# ── apply_proposal ────────────────────────────────────────────────────────────
-
-
-class TestApplyProposal:
-    def _setup(self, tmp_path: Path, content: str):
-        """Real file on disk + session with that file seeded in context."""
-        session = Session(model="test", working_dir=tmp_path, max_tokens=100_000)
-        path = _seed(session, tmp_path, "foo.py", content)
-        return session, path
-
-    # search-not-found
-
-    def test_search_not_found_returns_false(self, tmp_path):
-        session, path = self._setup(tmp_path, "actual\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="missing\n", replace="new\n"),
-            session, _mock_renderer(), _mock_reader(),
-        )
-        assert result is None
-
-    def test_search_not_found_prints_error(self, tmp_path):
-        session, path = self._setup(tmp_path, "actual\n")
-        renderer = _mock_renderer()
-        apply_proposal(
-            EditProposal(path=path, search="missing\n", replace="new\n"),
-            session, renderer, _mock_reader(),
-        )
-        renderer.print_error.assert_called()
-
-    def test_search_not_found_does_not_write_disk(self, tmp_path):
-        session, path = self._setup(tmp_path, "original\n")
-        apply_proposal(
-            EditProposal(path=path, search="missing\n", replace="new\n"),
-            session, _mock_renderer(), _mock_reader(),
-        )
-        assert path.read_text() == "original\n"
-
-    # ambiguity
-
-    def test_ambiguous_search_returns_false(self, tmp_path):
-        session, path = self._setup(tmp_path, "dup\ndup\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="dup\n", replace="unique\n"),
-            session, _mock_renderer(), _mock_reader(),
-        )
-        assert result is None
-
-    def test_ambiguous_search_prints_error(self, tmp_path):
-        session, path = self._setup(tmp_path, "dup\ndup\n")
-        renderer = _mock_renderer()
-        apply_proposal(
-            EditProposal(path=path, search="dup\n", replace="unique\n"),
-            session, renderer, _mock_reader(),
-        )
-        renderer.print_error.assert_called()
-
-    def test_ambiguous_search_does_not_write_disk(self, tmp_path):
-        content = "dup\ndup\n"
-        session, path = self._setup(tmp_path, content)
-        apply_proposal(
-            EditProposal(path=path, search="dup\n", replace="unique\n"),
-            session, _mock_renderer(), _mock_reader(),
-        )
-        assert path.read_text() == content
-
-    # confirmation — accepted
-
-    @pytest.mark.parametrize("answer", ["y", "Y", "yes", "YES", "Yes"])
-    def test_accepted_returns_true(self, tmp_path, answer):
-        session, path = self._setup(tmp_path, "old\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
-            session, _mock_renderer(), _mock_reader(answer),
-        )
-        assert result is not None
-
-    def test_accepted_writes_correct_content(self, tmp_path):
-        session, path = self._setup(tmp_path, "old content\n")
-        apply_proposal(
-            EditProposal(path=path, search="old content\n", replace="new content\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert path.read_text() == "new content\n"
-
-    def test_accepted_replaces_only_within_larger_file(self, tmp_path):
-        content = "prefix\nTARGET\nsuffix\n"
-        session, path = self._setup(tmp_path, content)
-        apply_proposal(
-            EditProposal(path=path, search="TARGET\n", replace="REPLACED\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert path.read_text() == "prefix\nREPLACED\nsuffix\n"
-
-    # confirmation — declined
-
-    @pytest.mark.parametrize("answer", ["n", "N", "no", "", "nope"])
-    def test_declined_returns_false(self, tmp_path, answer):
-        session, path = self._setup(tmp_path, "old\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
-            session, _mock_renderer(), _mock_reader(answer),
-        )
-        assert result is None
-
-    def test_declined_does_not_write_disk(self, tmp_path):
-        session, path = self._setup(tmp_path, "original\n")
-        apply_proposal(
-            EditProposal(path=path, search="original\n", replace="changed\n"),
-            session, _mock_renderer(), _mock_reader("n"),
-        )
-        assert path.read_text() == "original\n"
-
-    # diff display
-
-    def test_diff_displayed_before_confirmation(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        renderer = _mock_renderer()
-        apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
-            session, renderer, _mock_reader("y"),
-        )
-        renderer.print_info.assert_called()
-
-    # session isolation
-
-    def test_context_files_not_updated_after_apply(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        # refresh_files() should pick this up next turn — not apply_proposal's job
-        assert session.context_files[path].content == "old\n"
-
-    # prompt content
-
-    def test_file_without_trailing_newline_is_matched(self, tmp_path):
-        # Regression: parse_proposals always produces search/replace with a
-        # structural trailing \n.  When the file's last line has no \n, a direct
-        # count() would return 0.  apply_proposal must fall back to stripping \n
-        # from both search and replace before matching — and must NOT add a
-        # trailing \n to the written file content.
-        content = "print('hello world')"          # no trailing newline
-        session, path = self._setup(tmp_path, content)
-        result = apply_proposal(
-            EditProposal(
-                path=path,
-                search="print('hello world')\n",    # structural \n from parse_proposals
-                replace="print('hello world!')\n",
-            ),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert result is not None
-        assert path.read_text() == "print('hello world!')"  # no trailing \n added
-
-    def test_prompt_mentions_filename(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        reader = _mock_reader("y")
-        apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
-            session, _mock_renderer(), reader,
-        )
-        prompt = reader.read_line.call_args.args[0]
-        assert "foo.py" in prompt
 
 
 # ── sanitize_for_display ──────────────────────────────────────────────────────
@@ -463,164 +311,220 @@ class TestSanitizeForDisplay:
         assert "Let me know if that looks good." in result
 
 
-# ── apply_proposal → change history ─────────────────────────────────────────────
+# ── apply_edits ───────────────────────────────────────────────────────────────
 
 
-class TestApplyProposalReturnsRecord:
-    """apply_proposal returns the applied edit as a ChangeRecord (search/replace
-    fragment) or None, and no longer touches the undo/redo stacks — grouping
-    edits into a checkpoint is the chat loop's job.
+class TestApplyEdits:
+    """apply_edits groups proposals by file, folds each file's blocks into one
+    combined whole-file change, shows the diffs, asks a SINGLE atomic [y/N] for
+    the whole turn, and writes confirmed files once each.  It returns one
+    EditOutcome per file carrying the before/after FileSnapshot for the change
+    history.  Snapshots replace the old per-block ChangeRecord model.
     """
 
-    def _setup(self, tmp_path: Path, content: str):
+    def _setup(self, tmp_path: Path, files: dict[str, str]):
         session = Session(model="test", working_dir=tmp_path, max_tokens=100_000)
-        path = _seed(session, tmp_path, "foo.py", content)
-        return session, path
+        paths = {name: _seed(session, tmp_path, name, content) for name, content in files.items()}
+        return session, paths
 
-    # confirmed edit → returns a ChangeRecord
+    # single file
 
-    def test_confirmed_returns_change_record(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
+    def test_single_file_applies_and_writes(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        outcomes = apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
             session, _mock_renderer(), _mock_reader("y"),
         )
-        assert isinstance(result, ChangeRecord)
+        assert paths["foo.py"].read_text() == "new\n"
+        assert len(outcomes) == 1
+        assert outcomes[0].applied is True
 
-    def test_record_path_matches_proposal(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
+    def test_outcome_is_editoutcome_with_path(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        outcomes = apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
             session, _mock_renderer(), _mock_reader("y"),
         )
-        assert result.path == path
+        assert isinstance(outcomes[0], EditOutcome)
+        assert outcomes[0].path == paths["foo.py"]
 
-    def test_record_has_effective_search_and_replace(self, tmp_path):
-        session, path = self._setup(tmp_path, "old content\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="old content\n", replace="new content\n"),
+    def test_snapshot_holds_before_and_after(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        outcomes = apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
             session, _mock_renderer(), _mock_reader("y"),
         )
-        assert result.search == "old content\n"
-        assert result.replace == "new content\n"
+        snap = outcomes[0].snapshot
+        assert isinstance(snap, FileSnapshot)
+        assert snap.before == "old\n"
+        assert snap.after == "new\n"
 
-    def test_narrow_fallback_record_has_stripped_fragments(self, tmp_path):
-        session, path = self._setup(tmp_path, "print('hello world')")  # no trailing newline
-        result = apply_proposal(
-            EditProposal(
-                path=path,
-                search="print('hello world')\n",
-                replace="print('hello world!')\n",
-            ),
+    def test_snapshot_records_write_mtime(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        outcomes = apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
             session, _mock_renderer(), _mock_reader("y"),
         )
-        assert result.search == "print('hello world')"
-        assert result.replace == "print('hello world!')"
+        assert outcomes[0].snapshot.mtime == paths["foo.py"].stat().st_mtime
 
-    # edits that never write → None
+    # grouping / composition — one snapshot per file
 
-    def test_declined_returns_none(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
+    def test_two_blocks_same_file_compose_into_one_snapshot(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "a\nb\nc\n"})
+        outcomes = apply_edits(
+            [
+                EditProposal(path=paths["foo.py"], search="a\n", replace="A\n"),
+                EditProposal(path=paths["foo.py"], search="c\n", replace="C\n"),
+            ],
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert paths["foo.py"].read_text() == "A\nb\nC\n"
+        assert len(outcomes) == 1                       # grouped per file
+        assert outcomes[0].snapshot.before == "a\nb\nc\n"
+        assert outcomes[0].snapshot.after == "A\nb\nC\n"
+
+    def test_later_block_sees_earlier_block_result(self, tmp_path):
+        # block 2's search ("y") only exists AFTER block 1 (x→y) applies.
+        session, paths = self._setup(tmp_path, {"foo.py": "x\n"})
+        apply_edits(
+            [
+                EditProposal(path=paths["foo.py"], search="x\n", replace="y\n"),
+                EditProposal(path=paths["foo.py"], search="y\n", replace="z\n"),
+            ],
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert paths["foo.py"].read_text() == "z\n"
+
+    # multiple files — atomic single confirmation
+
+    def test_two_files_two_outcomes_both_written(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"a.py": "a\n", "b.py": "b\n"})
+        outcomes = apply_edits(
+            [
+                EditProposal(path=paths["a.py"], search="a\n", replace="A\n"),
+                EditProposal(path=paths["b.py"], search="b\n", replace="B\n"),
+            ],
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        assert paths["a.py"].read_text() == "A\n"
+        assert paths["b.py"].read_text() == "B\n"
+        assert len(outcomes) == 2
+        assert all(o.applied for o in outcomes)
+
+    def test_single_confirmation_for_all_files(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"a.py": "a\n", "b.py": "b\n"})
+        reader = _mock_reader("y")
+        apply_edits(
+            [
+                EditProposal(path=paths["a.py"], search="a\n", replace="A\n"),
+                EditProposal(path=paths["b.py"], search="b\n", replace="B\n"),
+            ],
+            session, _mock_renderer(), reader,
+        )
+        assert reader.read_line.call_count == 1
+
+    def test_decline_writes_nothing_atomically(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"a.py": "a\n", "b.py": "b\n"})
+        outcomes = apply_edits(
+            [
+                EditProposal(path=paths["a.py"], search="a\n", replace="A\n"),
+                EditProposal(path=paths["b.py"], search="b\n", replace="B\n"),
+            ],
             session, _mock_renderer(), _mock_reader("n"),
         )
-        assert result is None
+        assert paths["a.py"].read_text() == "a\n"
+        assert paths["b.py"].read_text() == "b\n"
+        assert all(not o.applied for o in outcomes)
+        assert all(o.snapshot is None for o in outcomes)
 
-    def test_search_not_found_returns_none(self, tmp_path):
-        session, path = self._setup(tmp_path, "actual\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="missing\n", replace="new\n"),
+    # diff display + prompt
+
+    def test_diff_shown_before_confirmation(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        renderer = _mock_renderer()
+        apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
+            session, renderer, _mock_reader("y"),
+        )
+        renderer.print_info.assert_called()
+
+    def test_prompt_mentions_filename(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        reader = _mock_reader("y")
+        apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
+            session, _mock_renderer(), reader,
+        )
+        prompt = reader.read_line.call_args.args[0]
+        assert "foo.py" in prompt
+
+    # conflicting blocks are skipped, others still apply
+
+    def test_conflicting_block_skipped_others_apply(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "a\nb\nc\n"})
+        renderer = _mock_renderer()
+        outcomes = apply_edits(
+            [
+                EditProposal(path=paths["foo.py"], search="a\n", replace="A\n"),
+                EditProposal(path=paths["foo.py"], search="missing\n", replace="Z\n"),
+            ],
+            session, renderer, _mock_reader("y"),
+        )
+        assert paths["foo.py"].read_text() == "A\nb\nc\n"
+        assert outcomes[0].applied is True
+        renderer.print_error.assert_called()
+
+    # no-op: a file whose only block fails to match is not a change
+
+    def test_unmatched_only_block_is_noop_not_applied(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "real\n"})
+        outcomes = apply_edits(
+            [EditProposal(path=paths["foo.py"], search="missing\n", replace="Z\n")],
             session, _mock_renderer(), _mock_reader("y"),
         )
-        assert result is None
+        assert paths["foo.py"].read_text() == "real\n"
+        assert outcomes[0].applied is False
+        assert outcomes[0].snapshot is None
 
-    def test_ambiguous_returns_none(self, tmp_path):
-        session, path = self._setup(tmp_path, "dup\ndup\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="dup\n", replace="unique\n"),
+    def test_no_changes_does_not_prompt(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "real\n"})
+        reader = _mock_reader("y")
+        apply_edits(
+            [EditProposal(path=paths["foo.py"], search="missing\n", replace="Z\n")],
+            session, _mock_renderer(), reader,
+        )
+        reader.read_line.assert_not_called()
+
+    # narrow trailing-newline fallback (last line, no newline)
+
+    def test_file_without_trailing_newline_is_matched(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "print('hi')"})
+        outcomes = apply_edits(
+            [EditProposal(path=paths["foo.py"], search="print('hi')\n", replace="print('bye')\n")],
             session, _mock_renderer(), _mock_reader("y"),
         )
-        assert result is None
+        assert outcomes[0].applied is True
+        assert paths["foo.py"].read_text() == "print('bye')"   # no trailing \n added
 
-    # no longer manages the undo/redo stacks
+    # isolation
 
-    def test_apply_does_not_touch_undo_stack(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
+    def test_context_files_not_updated(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
+            session, _mock_renderer(), _mock_reader("y"),
+        )
+        # refresh_files() picks this up next turn — not apply_edits' job
+        assert session.context_files[paths["foo.py"]].content == "old\n"
+
+    def test_does_not_touch_undo_stack(self, tmp_path):
+        session, paths = self._setup(tmp_path, {"foo.py": "old\n"})
+        apply_edits(
+            [EditProposal(path=paths["foo.py"], search="old\n", replace="new\n")],
             session, _mock_renderer(), _mock_reader("y"),
         )
         assert session.undo_stack == []
 
-    def test_apply_does_not_touch_redo_stack(self, tmp_path):
-        session, path = self._setup(tmp_path, "old\n")
-        seeded = Checkpoint(records=[ChangeRecord(path=path, search="x\n", replace="y\n")])
-        session.redo_stack.append(seeded)
-        apply_proposal(
-            EditProposal(path=path, search="old\n", replace="new\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert session.redo_stack == [seeded]
-
-    # undoability via auto-expansion — when the literal replacement would not be
-    # uniquely locatable, the recorded fragment is widened with surrounding
-    # context so the edit still applies AND stays undoable.  Example:
-    # "marker\nOTHER\n" + (OTHER→marker) yields "marker\nmarker\n", where the
-    # bare "marker\n" is ambiguous, so the record widens to the whole region.
-
-    def test_non_unique_replacement_still_applies(self, tmp_path):
-        session, path = self._setup(tmp_path, "marker\nOTHER\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert result is not None
-
-    def test_non_unique_replacement_writes_new_content(self, tmp_path):
-        session, path = self._setup(tmp_path, "marker\nOTHER\n")
-        apply_proposal(
-            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert path.read_text() == "marker\nmarker\n"
-
-    def test_recorded_replace_is_unique_in_new_content(self, tmp_path):
-        session, path = self._setup(tmp_path, "marker\nOTHER\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert path.read_text().count(result.replace) == 1
-
-    def test_recorded_search_is_unique_in_original(self, tmp_path):
-        original = "marker\nOTHER\n"
-        session, path = self._setup(tmp_path, original)
-        result = apply_proposal(
-            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert original.count(result.search) == 1
-
-    def test_expanded_record_round_trips(self, tmp_path):
-        original = "marker\nOTHER\n"
-        session, path = self._setup(tmp_path, original)
-        result = apply_proposal(
-            EditProposal(path=path, search="OTHER\n", replace="marker\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        new_content = path.read_text()
-        # forward (redo) reproduces the new content; reverse (undo) restores it
-        assert original.replace(result.search, result.replace, 1) == new_content
-        assert new_content.replace(result.replace, result.search, 1) == original
-
-    def test_unique_replacement_is_not_expanded(self, tmp_path):
-        # Already-unique replacements are recorded verbatim (no needless widening).
-        session, path = self._setup(tmp_path, "alpha\nbeta\n")
-        result = apply_proposal(
-            EditProposal(path=path, search="beta\n", replace="gamma\n"),
-            session, _mock_renderer(), _mock_reader("y"),
-        )
-        assert result.search == "beta\n"
-        assert result.replace == "gamma\n"
-        assert path.read_text() == "alpha\ngamma\n"
+    def test_empty_proposals_returns_empty(self, tmp_path):
+        session, _ = self._setup(tmp_path, {})
+        assert apply_edits([], session, _mock_renderer(), _mock_reader("y")) == []
